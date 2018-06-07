@@ -231,6 +231,8 @@ class LongevityTest(ClusterTester):
         """
         for node in self.db_cluster.nodes:
             node.remoter.run('sudo nodetool flush')
+            node.remoter.run('sudo nodetool ring')
+            node.remoter.run('sudo nodetool describering keyspace1')
 
 if __name__ == '__main__':
     main()

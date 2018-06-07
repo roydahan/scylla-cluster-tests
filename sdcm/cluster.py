@@ -2188,8 +2188,6 @@ class BaseLoaderSet(object):
             for line in lines:
                 if 'java.io.IOException' in line:
                     errors += ['%s: %s' % (node, line.strip())]
-            plotfile = os.path.join(self.logdir, str(node))
-            self._cassandra_stress_plot(lines, plotfile, node, db_cluster)
 
         return cs_summary, errors
 
