@@ -267,7 +267,10 @@ class Nemesis(object):
                 self._terminate_cluster_node(self.target_node)
                 # Replace the node that was terminated.
                 if add_node:
-                    self._add_and_init_new_cluster_node(target_node_ip)
+                    new_node = self._add_and_init_new_cluster_node(target_node_ip)
+                for node in self.db_cluster.nodes:
+                    if node not in [self.target_node, new_node]:
+                        node.remoter.run('nodetool --host localhost cleanup keyspace1', verbose=True)
 
     def disrupt_terminate_and_replace_node(self):
         # using "Replace a Dead Node" procedure from http://docs.scylladb.com/procedures/replace_dead_node/
