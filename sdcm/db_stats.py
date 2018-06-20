@@ -91,7 +91,7 @@ def get_stress_bench_cmd_params(cmd):
     cmd_params = {}
     for key in ['partition-count', 'clustering-row-count', 'clustering-row-size', 'mode',
                 'workload', 'concurrency', 'max-rate', 'connection-count', 'replication-factor',
-                'timeout', 'client-compression']:
+                'timeout', 'client-compression', 'duration']:
         match = re.search('(-' + key + '\s+([^-| ]+))', cmd)
         if match:
             cmd_params[key] = match.group(2).strip()
@@ -178,7 +178,7 @@ class TestStatsMixin(Stats):
                     # exclude these params from gce run
                     continue
                 elif p[1] == 'n_db_nodes' and isinstance(p[2], str) and re.search('\s', p[2]):  # multidc
-                    setup_details['n_db_nodes'] = re.sub('\s', '_', p[2])
+                    setup_details['n_db_nodes'] = sum([int(i) for i in p[2].split()])
                 else:
                     setup_details[p[1]] = p[2]
 
