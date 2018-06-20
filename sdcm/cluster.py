@@ -317,7 +317,7 @@ class BaseNode(object):
         # We should disable bootstrap when we create nodes to establish the cluster,
         # if we want to add more nodes when the cluster already exists, then we should
         # enable bootstrap. So addition means not the first set of node.
-        self.is_addition = False
+        self.is_addition = None
         self.scylla_version = ''
         self.is_enterprise = None
         self.replacement_node_ip = None  # if node is a replacement for a dead node, store dead node private ip here
@@ -1017,14 +1017,14 @@ WantedBy=multi-user.target
             scylla_yaml_contents = p.sub('endpoint_snitch: "{0}"'.format(endpoint_snitch),
                                          scylla_yaml_contents)
 
-        if self.is_addition:
+        if self.is_addition is True:
             if 'auto_bootstrap' in scylla_yaml_contents:
                 p = re.compile('auto_bootstrap:.*')
                 scylla_yaml_contents = p.sub('auto_bootstrap: True',
                                              scylla_yaml_contents)
             else:
                 scylla_yaml_contents += "\nauto_bootstrap: True\n"
-        else:
+        elif self.is_addition is False:
             if 'auto_bootstrap' in scylla_yaml_contents:
                 p = re.compile('auto_bootstrap:.*')
                 scylla_yaml_contents = p.sub('auto_bootstrap: False',
