@@ -372,9 +372,12 @@ class ScyllaAWSCluster(AWSCluster, cluster.BaseScyllaCluster):
 
     def add_nodes(self, count, ec2_user_data='', dc_idx=0):
         if not ec2_user_data:
-            ec2_user_data = ('--clustername %s --bootstrap true '
-                             '--totalnodes %s ' % (self.name,
-                                                   count))
+            if self._ec2_user_data:
+                ec2_user_data = self._ec2_user_data
+            else:
+                ec2_user_data = ('--clustername %s --bootstrap true '
+                                 '--totalnodes %s ' % (self.name,
+                                                       count))
         if self.nodes:
             if dc_idx > 0:
                 node_public_ips = [node.public_ip_address for node
@@ -388,7 +391,7 @@ class ScyllaAWSCluster(AWSCluster, cluster.BaseScyllaCluster):
                 seeds = ",".join(node_private_ips)
                 if not seeds:
                     seeds = self.nodes[0].private_ip_address
-            ec2_user_data += ' --seeds %s' % seeds
+            ec2_user_data += ' --seeds %s --bootstrap true' % seeds
 
         added_nodes = super(ScyllaAWSCluster, self).add_nodes(count=count,
                                                               ec2_user_data=ec2_user_data,
