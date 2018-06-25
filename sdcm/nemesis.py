@@ -269,7 +269,7 @@ class Nemesis(object):
                 # Replace the node that was terminated.
                 if add_node:
                     new_node = self._add_and_init_new_cluster_node()
-                for node in self.db_cluster.nodes:
+                for node in self.cluster.nodes:
                     if node not in [self.target_node, new_node]:
                         node.remoter.run('nodetool --host localhost cleanup keyspace1', verbose=True)
 
