@@ -322,14 +322,15 @@ class AWSNode(cluster.BaseNode):
             self._instance.reload()
 
     def restart(self):
-        self._instance.stop()
-        self._instance_wait_safe(self._instance.wait_until_stopped)
-        self._instance.start()
-        self._instance_wait_safe(self._instance.wait_until_running)
-        self._wait_public_ip()
-        self.log.debug('Got new public IP %s',
-                       self._instance.public_ip_address)
-        self.remoter.hostname = self._instance.public_ip_address
+        # self._instance.stop()
+        # self._instance_wait_safe(self._instance.wait_until_stopped)
+        # self._instance.start()
+        # self._instance_wait_safe(self._instance.wait_until_running)
+        # self._wait_public_ip()
+        # self.log.debug('Got new public IP %s',
+        #                self._instance.public_ip_address)
+        # self.remoter.hostname = self._instance.public_ip_address
+        self.remoter.run('sudo reboot')
         self.wait_db_up()
 
     def destroy(self):
