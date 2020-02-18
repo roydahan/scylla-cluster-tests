@@ -132,6 +132,9 @@ class LongevityTest(ClusterTester):
         if prepare_write_cmd:
             # In some cases (like many keyspaces), we want to create the schema (all keyspaces & tables) before the load
             # starts - due to the heavy load, the schema propogation can take long time and c-s fails.
+            if self.params.get('pre_create_keyspace'):
+                self._pre_create_keyspace()
+
             if pre_create_schema:
                 self._pre_create_schema(keyspace_num, scylla_encryption_options=self.params.get(
                     'scylla_encryption_options', None))
@@ -437,8 +440,9 @@ class LongevityTest(ClusterTester):
             keyspace_name = 'keyspace{}'.format(i)
             self.create_keyspace(keyspace_name=keyspace_name, replication_factor=3)
             self.log.debug('{} Created'.format(keyspace_name))
-            self.create_table(name='standard1', keyspace_name=keyspace_name, key_type='blob', read_repair=0.0, compact_storage=True,
-                              columns={'"C0"': 'blob', '"C1"': 'blob', '"C2"': 'blob', '"C3"': 'blob', '"C4"': 'blob'},
+            self.create_table(name='standard1', keyspace_name=keyspace_name, key_type='blob', read_repair=0.0,
+                              compact_storage=True, columns={'"C0"': 'blob', '"C1"': 'blob',
+                                                             '"C2"': 'blob', '"C3"': 'blob', '"C4"': 'blob'},
                               in_memory=in_memory, scylla_encryption_options=scylla_encryption_options)
 
     def _pre_create_templated_user_schema(self, batch_start=None, batch_end=None):
@@ -479,6 +483,13 @@ class LongevityTest(ClusterTester):
                             session.execute(query)
                         except (AlreadyExists, InvalidRequest) as exc:
                             self.log.debug('extra definition for [{}] exists [{}]'.format(table_name, str(exc)))
+
+    def _pre_create_keyspace(self):
+            query = self.params.get('pre_create_keyspace')
+            node = self.db_cluster.nodes[0]
+            # pylint: disable=no-member
+            with self.cql_connection_patient(node) as session:
+                session.execute(query)
 
     def _flush_all_nodes(self):
         """

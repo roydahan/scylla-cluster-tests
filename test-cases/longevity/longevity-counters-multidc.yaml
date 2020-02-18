@@ -1,0 +1,21 @@
+test_duration: 5760
+
+pre_create_keyspace: "CREATE KEYSPACE scylla_bench WITH replication = {'class': 'NetworkTopologyStrategy', 'us-eastscylla_node_east': '3', 'us-west-2scylla_node_west': '3', 'eu-westscylla_node_west': '3'};"
+prepare_write_cmd: "scylla-bench -workload=sequential  -mode=counter_update -replication-factor=3 -partition-count=10100 -clustering-row-count=10 -iterations 10000000 -validate-data"
+stress_cmd:         "scylla-bench -workload=sequential -mode=counter_read   -replication-factor=3 -partition-count=10100 -clustering-row-count=10 -iterations 10       -validate-data"
+
+n_db_nodes: '4 4 4'
+n_loaders:  1
+n_monitor_nodes: 1
+
+instance_type_db: 'i3.2xlarge'
+
+user_prefix: longevity-counters-multidc
+
+space_node_threshold: 6442
+
+nemesis_class_name: 'ChaosMonkey'
+nemesis_interval: 15
+nemesis_during_prepare: true
+
+use_mgmt: true
