@@ -1,0 +1,19 @@
+test_duration: 180
+
+stress_cmd:      "scylla-bench -workload=sequential -mode=counter_update -replication-factor=3 -partition-count=100 -clustering-row-count=10 -iterations 10000 -validate-data"
+stress_read_cmd: "scylla-bench -workload=sequential -mode=counter_read   -replication-factor=3 -partition-count=100 -clustering-row-count=10 -iterations 10    -validate-data"
+
+n_db_nodes: '4'
+n_loaders:  1
+n_monitor_nodes: 1
+
+instance_type_db: 'i3.2xlarge'
+
+user_prefix: longevity-counters-multidc
+
+space_node_threshold: 6442
+
+nemesis_class_name: 'NodeTerminateAndReplace'
+nemesis_interval: 15
+
+use_mgmt: true
