@@ -15,5 +15,6 @@ space_node_threshold: 6442
 
 nemesis_class_name: 'NodeTerminateAndReplace'
 nemesis_interval: 15
+append_scylla_args: '--blocked-reactor-notify-ms 500 --abort-on-lsa-bad-alloc 1 --abort-on-seastar-bad-alloc'
 
 use_mgmt: true
