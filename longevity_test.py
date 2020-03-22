@@ -485,11 +485,11 @@ class LongevityTest(ClusterTester):
                             self.log.debug('extra definition for [{}] exists [{}]'.format(table_name, str(exc)))
 
     def _pre_create_keyspace(self):
-            query = self.params.get('pre_create_keyspace')
-            node = self.db_cluster.nodes[0]
-            # pylint: disable=no-member
-            with self.cql_connection_patient(node) as session:
-                session.execute(query)
+        query = self.params.get('pre_create_keyspace')
+        node = self.db_cluster.nodes[0]
+        # pylint: disable=no-member
+        with self.cql_connection_patient(node) as session:
+            session.execute(query)
 
     def _flush_all_nodes(self):
         """
