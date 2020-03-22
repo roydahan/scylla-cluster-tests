@@ -16,9 +16,6 @@ space_node_threshold: 16106127360
 
 user_prefix: 'perf-latency-admin-ops'
 
-failure_post_behavior: keep
-
-
 use_mgmt: true
 
 server_encrypt: 'true'
