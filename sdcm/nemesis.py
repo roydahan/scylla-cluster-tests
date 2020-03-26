@@ -183,14 +183,16 @@ class Nemesis():  # pylint: disable=too-many-instance-attributes,too-many-public
         for operation in self.operation_log:
             self.log.info(operation)
 
-    def get_list_of_disrupt_methods_for_nemesis_subclasses(self, disruptive=None, run_with_gemini=None,
-                                                           networking=None):  # pylint: disable=invalid-name
+    def get_list_of_disrupt_methods_for_nemesis_subclasses(self, disruptive=None, run_with_gemini=None, networking=None,
+                                                           admin_perf_impact=None):  # pylint: disable=invalid-name
         if disruptive is not None:
             return self._get_subclasses_disrupt_methods(disruptive=disruptive)
         if run_with_gemini is not None:
             return self._get_subclasses_disrupt_methods(run_with_gemini=run_with_gemini)
         if networking is not None:
             return self._get_subclasses_disrupt_methods(networking=networking)
+        if admin_perf_impact is not None:
+            return self._get_subclasses_disrupt_methods(admin_perf_impact=admin_perf_impact)
         return None
 
     def _get_subclasses_disrupt_methods(self, **kwargs):
@@ -656,6 +658,32 @@ class Nemesis():  # pylint: disable=too-many-instance-attributes,too-many-public
             self.log.info("<<<<<<<<<<<<<Finished random_disrupt_method %s" % disrupt_method_name)
         finally:
             self.metrics_srv.event_stop(disrupt_method_name)
+
+    def call_sequential_disrupt_method(self, disrupt_methods=None, num_of_nemesis_repeats=1, num_of_sequence_repeats=1):
+
+        if not disrupt_methods:
+            raise NoMandatoryParameter('Got an empty disruption method list')
+
+        disrupt_methods = [attr[1] for attr in inspect.getmembers(self) if
+                           attr[0] in disrupt_methods and
+                           callable(attr[1])]
+        disrupt_methods = sorted(disrupt_methods * num_of_nemesis_repeats) * num_of_sequence_repeats
+
+        for disrupt_method in disrupt_methods:
+            disrupt_method_name = disrupt_method.__name__.replace('disrupt_', '')
+            self.log.info(">>>>>>>>>>>>>Started random_disrupt_method %s" % disrupt_method_name)
+            self.metrics_srv.event_start(disrupt_method_name)
+            try:
+                disrupt_method()
+            except Exception as exc:  # pylint: disable=broad-except
+                error_msg = "Exception in random_disrupt_method %s: %s", disrupt_method_name, exc
+                self.log.error(error_msg)
+                self.error_list.append(error_msg)
+                raise
+            else:
+                self.log.info("<<<<<<<<<<<<<Finished random_disrupt_method %s" % disrupt_method_name)
+            finally:
+                self.metrics_srv.event_stop(disrupt_method_name)
 
     def repair_nodetool_repair(self, node=None):
         node = node if node else self.target_node
@@ -1871,6 +1899,7 @@ class DrainerMonkey(Nemesis):
 
 class CorruptThenRepairMonkey(Nemesis):
     disruptive = True
+    admin_perf_impact = True
 
     @log_time_elapsed_and_status
     def disrupt(self):
@@ -1879,6 +1908,7 @@ class CorruptThenRepairMonkey(Nemesis):
 
 class CorruptThenRebuildMonkey(Nemesis):
     disruptive = True
+    admin_perf_impact = True
 
     @log_time_elapsed_and_status
     def disrupt(self):
@@ -1887,6 +1917,7 @@ class CorruptThenRebuildMonkey(Nemesis):
 
 class DecommissionMonkey(Nemesis):
     disruptive = True
+    admin_perf_impact = True
 
     @log_time_elapsed_and_status
     def disrupt(self):
@@ -1895,6 +1926,7 @@ class DecommissionMonkey(Nemesis):
 
 class NoCorruptRepairMonkey(Nemesis):
     disruptive = False
+    admin_perf_impact = True
 
     @log_time_elapsed_and_status
     def disrupt(self):
@@ -1903,6 +1935,7 @@ class NoCorruptRepairMonkey(Nemesis):
 
 class MajorCompactionMonkey(Nemesis):
     disruptive = False
+    admin_perf_impact = True
 
     @log_time_elapsed_and_status
     def disrupt(self):
@@ -2185,6 +2218,7 @@ class ToggleTableIcsMonkey(Nemesis):
 
 class MgmtBackup(Nemesis):
     disruptive = False
+    admin_perf_impact = True
 
     @log_time_elapsed_and_status
     def disrupt(self):
@@ -2193,6 +2227,7 @@ class MgmtBackup(Nemesis):
 
 class MgmtRepair(Nemesis):
     disruptive = False
+    admin_perf_impact = True
 
     @log_time_elapsed_and_status
     def disrupt(self):
@@ -2391,6 +2426,18 @@ class GeminiNonDisruptiveChaosMonkey(Nemesis):
     @log_time_elapsed_and_status
     def disrupt(self):
         self.call_random_disrupt_method(disrupt_methods=self.disrupt_methods_list)
+
+
+class AdminPerfImpactMonkey(Nemesis):
+    def __init__(self, *args, **kwargs):
+        super(AdminPerfImpactMonkey, self).__init__(*args, **kwargs)
+        self.disrupt_methods_list = self.get_list_of_disrupt_methods_for_nemesis_subclasses(admin_perf_impact=True)
+
+    @log_time_elapsed_and_status
+    def disrupt(self):
+        self.log.info(f"List of Nemesis to call: {self.disrupt_methods_list}")
+        self.call_sequential_disrupt_method(disrupt_methods=self.disrupt_methods_list, num_of_nemesis_repeats=2,
+                                            num_of_sequence_repeats=1)
 
 
 RELATIVE_NEMESIS_SUBCLASS_LIST = [NotSpotNemesis]
