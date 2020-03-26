@@ -2449,4 +2449,4 @@ COMPLEX_NEMESIS = [NoOpMonkey, ChaosMonkey,
                    ScyllaCloudLimitedChaosMonkey,
                    AllMonkey, MdcChaosMonkey,
                    DisruptiveMonkey, NonDisruptiveMonkey, GeminiNonDisruptiveChaosMonkey,
-                   GeminiChaosMonkey, NetworkMonkey]
+                   GeminiChaosMonkey, NetworkMonkey, AdminPerfImpactMonkey]

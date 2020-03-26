@@ -186,11 +186,13 @@ class PerformanceRegressionTest(ClusterTester):  # pylint: disable=too-many-publ
         self.create_test_stats(sub_type='read', doc_id_with_timestamp=True)
         stress_queue = self.run_stress_thread(stress_cmd=base_cmd_r, stress_num=1, stats_aggregate_cmds=False)
         if nemesis:
+            interval = self.params.get('nemesis_interval', default=10)
+            time.sleep(interval)  # Sleeping one interval before starting the nemesis
             self.db_cluster.add_nemesis(nemesis=self.get_nemesis_class(), tester_obj=self)
-            self.db_cluster.start_nemesis(interval=self.params.get('nemesis_interval', default=10))
+            self.db_cluster.start_nemesis(interval=interval)
         results = self.get_stress_results(queue=stress_queue)
         self.update_test_details()
-        self.display_results(results, test_name='test_latency')
+        self.display_results(results, test_name='test_latency' if not nemesis else 'test_latency_with_nemesis')
         self.check_regression()
 
     def run_write_workload(self, nemesis=False):
@@ -219,6 +221,22 @@ class PerformanceRegressionTest(ClusterTester):  # pylint: disable=too-many-publ
         results = self.get_stress_results(queue=stress_queue)
         self.update_test_details(scylla_conf=True)
         self.display_results(results, test_name='test_latency')
+        self.check_regression()
+
+    def run_workload(self, stress_cmd, nemesis=False):
+        # create new document in ES with doc_id = test_id + timestamp
+        # allow to correctly save results for future compare
+        sub_type = 'read' if ' read ' in stress_cmd else 'write' if ' write ' in stress_cmd else 'mixed'
+        self.create_test_stats(sub_type=sub_type, doc_id_with_timestamp=True)
+        stress_queue = self.run_stress_thread(stress_cmd=stress_cmd, stress_num=1, stats_aggregate_cmds=False)
+        if nemesis:
+            interval = self.params.get('nemesis_interval', default=15)
+            time.sleep(interval)  # Sleeping one interval before starting the nemesis
+            self.db_cluster.add_nemesis(nemesis=self.get_nemesis_class(), tester_obj=self)
+            self.db_cluster.start_nemesis(interval=interval)
+        results = self.get_stress_results(queue=stress_queue)
+        self.update_test_details()
+        self.display_results(results, test_name='test_latency' if not nemesis else 'test_latency_with_nemesis')
         self.check_regression()
 
     def prepare_mv(self, on_populated=False):
@@ -486,25 +504,26 @@ class PerformanceRegressionTest(ClusterTester):  # pylint: disable=too-many-publ
         self.run_fstrim_on_all_db_nodes()
         self.run_mixed_workload()
 
-    def test_latency_with_nemesis(self):
-        """
-        Test steps:
-
-        1. Prepare cluster with data (reach steady_stet of compactions and ~x10 capacity than RAM.
-        with round_robin and list of stress_cmd - the data will load several times faster.
-        2. Run WRITE workload with gauss population.
-        """
+    def test_latency_read_with_nemesis(self):
         self.run_fstrim_on_all_db_nodes()
         self.preload_data()
         self.wait_no_compactions_running()
         self.run_fstrim_on_all_db_nodes()
-        self.run_read_workload(nemesis=True)
+        self.run_workload(stress_cmd=self.params.get('stress_cmd_r'), nemesis=True)
+
+    def test_latency_write_with_nemesis(self):
+        self.run_fstrim_on_all_db_nodes()
+        self.preload_data()
         self.wait_no_compactions_running()
         self.run_fstrim_on_all_db_nodes()
-        self.run_write_workload(nemesis=True)
+        self.run_workload(stress_cmd=self.params.get('stress_cmd_w'), nemesis=True)
+
+    def test_latency_mixed_with_nemesis(self):
+        self.run_fstrim_on_all_db_nodes()
+        self.preload_data()
         self.wait_no_compactions_running()
         self.run_fstrim_on_all_db_nodes()
-        self.run_mixed_workload(nemesis=True)
+        self.run_workload(stress_cmd=self.params.get('stress_cmd_m'), nemesis=True)
 
     # MV Tests
     def test_mv_write(self):
