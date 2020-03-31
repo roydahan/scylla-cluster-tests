@@ -73,6 +73,7 @@ class Nemesis():  # pylint: disable=too-many-instance-attributes,too-many-public
     disruptive = False
     run_with_gemini = True
     networking = False
+    admin_perf_impact = False
 
     def __init__(self, tester_obj, termination_event):
         self.tester = tester_obj  # ClusterTester object
