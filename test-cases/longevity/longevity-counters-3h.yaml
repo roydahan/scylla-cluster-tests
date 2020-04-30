@@ -1,7 +1,7 @@
 test_duration: 180
 
-stress_cmd:      "scylla-bench -workload=sequential -mode=counter_update -replication-factor=3 -partition-count=100 -clustering-row-count=10 -iterations 10000 -validate-data"
-stress_read_cmd: "scylla-bench -workload=sequential -mode=counter_read   -replication-factor=3 -partition-count=100 -clustering-row-count=10 -iterations 10    -validate-data"
+stress_cmd:      "scylla-bench -workload=sequential -mode=counter_update -replication-factor=3 -partition-count=10000 -clustering-row-count=10 -iterations 10000 -validate-data"
+stress_read_cmd: "scylla-bench -workload=sequential -mode=counter_read   -replication-factor=3 -partition-count=10000 -clustering-row-count=10 -iterations 10000 -validate-data"
 
 n_db_nodes: '4'
 n_loaders:  1
@@ -13,9 +13,7 @@ user_prefix: longevity-counters-multidc
 
 space_node_threshold: 6442
 
-nemesis_class_name: 'NodeTerminateAndReplace'
+nemesis_class_name: 'ChaosMonkey'
 nemesis_interval: 15
-append_scylla_args: '--blocked-reactor-notify-ms 500 --abort-on-lsa-bad-alloc 1 --abort-on-seastar-bad-alloc'
-hinted_handoff: 'disabled'
 
 use_mgmt: true
