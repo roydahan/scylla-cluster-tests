@@ -1717,6 +1717,7 @@ server_encryption_options:
                     apt-get install software-properties-common -y
                     apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 6B2BFD3660EF3F5B
                     apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 17723034C56D4B19
+                    apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 5e08fbd8b5d6ec9c
                     add-apt-repository -y ppa:scylladb/ppa
                     apt-get update
                     apt-get install -y openjdk-8-jre-headless
@@ -1931,6 +1932,8 @@ server_encryption_options:
         else:
             self.remoter.run('sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 6B2BFD3660EF3F5B', retry=3)
             self.remoter.run('sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 17723034C56D4B19', retry=3)
+            self.remoter.run('sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 5e08fbd8b5d6ec9c', retry=3)
+
 
         self.log.debug("Copying TLS files from data_dir to node")
         self.remoter.send_files(src='./data_dir/ssl_conf', dst='/tmp/')
