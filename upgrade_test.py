@@ -419,169 +419,167 @@ class UpgradeTest(FillDatabaseData):
         well, upgrade all nodes to new version in the end.
         """
 
-        filter_errors = [{'line': 'Failed to load schema', 'type': 'DATABASE_ERROR'},
-                         {'line': 'Failed to load schema', 'type': 'SCHEMA_FAILURE'},
-                         {'line': 'Failed to pull schema', 'type': 'DATABASE_ERROR'},
-                         {'line': 'Backtrace:', 'type': 'BACKTRACE'}]
+        with DbEventsFilter(type='DATABASE_ERROR', line='Failed to load schema'), \
+                DbEventsFilter(type='SCHEMA_FAILURE', line='Failed to load schema'), \
+                DbEventsFilter(type='DATABASE_ERROR', line='Failed to pull schema'), \
+                DbEventsFilter(type='RUNTIME_ERROR', line='Failed to load schema'):
 
-        for error in filter_errors:
-            DbEventsFilter(type=error['type'], line=error['line'])
+            # In case the target version >= 3.1 we need to perform test for truncate entries
+            target_upgrade_version = self.params.get('target_upgrade_version', default='')
+            self.truncate_entries_flag = False
+            if target_upgrade_version and parse_version(target_upgrade_version) >= parse_version('3.1') and \
+                    not is_enterprise(target_upgrade_version):
+                self.truncate_entries_flag = True
 
-        # In case the target version >= 3.1 we need to perform test for truncate entries
-        target_upgrade_version = self.params.get('target_upgrade_version', default='')
-        self.truncate_entries_flag = False
-        if target_upgrade_version and parse_version(target_upgrade_version) >= parse_version('3.1') and \
-                not is_enterprise(target_upgrade_version):
-            self.truncate_entries_flag = True
+            # prepare test keyspaces and tables before upgrade to avoid schema change during mixed cluster.
+            self.prepare_keyspaces_and_tables()
+            self.fill_and_verify_db_data('BEFORE UPGRADE', pre_fill=True)
 
-        # prepare test keyspaces and tables before upgrade to avoid schema change during mixed cluster.
-        self.prepare_keyspaces_and_tables()
-        self.fill_and_verify_db_data('BEFORE UPGRADE', pre_fill=True)
+            # write workload during entire test
+            self.log.info('Starting c-s write workload during entire test')
+            write_stress_during_entire_test = self.params.get('write_stress_during_entire_test')
+            entire_write_cs_thread_pool = self.run_stress_thread(stress_cmd=write_stress_during_entire_test)
 
-        # write workload during entire test
-        self.log.info('Starting c-s write workload during entire test')
-        write_stress_during_entire_test = self.params.get('write_stress_during_entire_test')
-        entire_write_cs_thread_pool = self.run_stress_thread(stress_cmd=write_stress_during_entire_test)
+            # complex workload: prepare write
+            self.log.info('Starting c-s complex workload (5M) to prepare data')
+            stress_cmd_complex_prepare = self.params.get('stress_cmd_complex_prepare')
+            complex_cs_thread_pool = self.run_stress_thread(
+                stress_cmd=stress_cmd_complex_prepare, profile='data_dir/complex_schema.yaml')
 
-        # complex workload: prepare write
-        self.log.info('Starting c-s complex workload (5M) to prepare data')
-        stress_cmd_complex_prepare = self.params.get('stress_cmd_complex_prepare')
-        complex_cs_thread_pool = self.run_stress_thread(
-            stress_cmd=stress_cmd_complex_prepare, profile='data_dir/complex_schema.yaml')
+            # wait for the complex workload to finish
+            self.verify_stress_thread(complex_cs_thread_pool)
 
-        # wait for the complex workload to finish
-        self.verify_stress_thread(complex_cs_thread_pool)
+            # generate random order to upgrade
+            nodes_num = len(self.db_cluster.nodes)
+            # prepare an array containing the indexes
+            indexes = [x for x in range(nodes_num)]
+            # shuffle it so we will upgrade the nodes in a
+            # random order
+            random.shuffle(indexes)
 
-        # generate random order to upgrade
-        nodes_num = len(self.db_cluster.nodes)
-        # prepare an array containing the indexes
-        indexes = [x for x in range(nodes_num)]
-        # shuffle it so we will upgrade the nodes in a
-        # random order
-        random.shuffle(indexes)
+            # prepare write workload
+            self.log.info('Starting c-s prepare write workload (n=10000000)')
+            prepare_write_stress = self.params.get('prepare_write_stress')
+            prepare_write_cs_thread_pool = self.run_stress_thread(stress_cmd=prepare_write_stress)
+            self.log.info('Sleeping for 60s to let cassandra-stress start before the upgrade...')
+            time.sleep(60)
 
-        # prepare write workload
-        self.log.info('Starting c-s prepare write workload (n=10000000)')
-        prepare_write_stress = self.params.get('prepare_write_stress')
-        prepare_write_cs_thread_pool = self.run_stress_thread(stress_cmd=prepare_write_stress)
-        self.log.info('Sleeping for 60s to let cassandra-stress start before the upgrade...')
-        time.sleep(60)
+            # Prepare keyspace and tables for truncate test
+            if self.truncate_entries_flag:
+                self.insert_rows = 10
+                self.fill_db_data_for_truncate_test(insert_rows=self.insert_rows)
 
-        # Prepare keyspace and tables for truncate test
-        if self.truncate_entries_flag:
-            self.insert_rows = 10
-            self.fill_db_data_for_truncate_test(insert_rows=self.insert_rows)
-
-        # upgrade first node
-        self.db_cluster.node_to_upgrade = self.db_cluster.nodes[indexes[0]]
-        self.log.info('Upgrade Node %s begin', self.db_cluster.node_to_upgrade.name)
-        self.upgrade_node(self.db_cluster.node_to_upgrade)
-        self.log.info('Upgrade Node %s ended', self.db_cluster.node_to_upgrade.name)
-        self.db_cluster.node_to_upgrade.check_node_health()
-
-        # wait for the prepare write workload to finish
-        self.verify_stress_thread(prepare_write_cs_thread_pool)
-
-        # read workload (cl=QUORUM)
-        self.log.info('Starting c-s read workload (cl=QUORUM n=10000000)')
-        stress_cmd_read_cl_quorum = self.params.get('stress_cmd_read_cl_quorum')
-        read_stress_queue = self.run_stress_thread(stress_cmd=stress_cmd_read_cl_quorum)
-        # wait for the read workload to finish
-        self.verify_stress_thread(read_stress_queue)
-        self.fill_and_verify_db_data('after upgraded one node')
-
-        # read workload
-        self.log.info('Starting c-s read workload for 10m')
-        stress_cmd_read_10m = self.params.get('stress_cmd_read_10m')
-        read_10m_cs_thread_pool = self.run_stress_thread(stress_cmd=stress_cmd_read_10m)
-
-        self.log.info('Sleeping for 60s to let cassandra-stress start before the upgrade...')
-        time.sleep(60)
-
-        # upgrade second node
-        self.db_cluster.node_to_upgrade = self.db_cluster.nodes[indexes[1]]
-        self.log.info('Upgrade Node %s begin', self.db_cluster.node_to_upgrade.name)
-        self.upgrade_node(self.db_cluster.node_to_upgrade)
-        self.log.info('Upgrade Node %s ended', self.db_cluster.node_to_upgrade.name)
-        self.db_cluster.node_to_upgrade.check_node_health()
-
-        # wait for the 10m read workload to finish
-        self.verify_stress_thread(read_10m_cs_thread_pool)
-        self.fill_and_verify_db_data('after upgraded two nodes')
-
-        # read workload (80m)
-        self.log.info('Starting c-s read workload for 80m')
-        stress_cmd_read_80m = self.params.get('stress_cmd_read_80m')
-        read_80m_cs_thread_pool = self.run_stress_thread(stress_cmd=stress_cmd_read_80m)
-        self.log.info('Sleeping for 60s to let cassandra-stress start before the rollback...')
-        time.sleep(60)
-
-        # rollback second node
-        self.log.info('Rollback Node %s begin', self.db_cluster.nodes[indexes[1]].name)
-        self.rollback_node(self.db_cluster.nodes[indexes[1]])
-        self.log.info('Rollback Node %s ended', self.db_cluster.nodes[indexes[1]].name)
-        self.db_cluster.nodes[indexes[1]].check_node_health()
-
-        self.fill_and_verify_db_data('after rollback the second node')
-
-        for i in indexes[1:]:
-            self.db_cluster.node_to_upgrade = self.db_cluster.nodes[i]
+            # upgrade first node
+            self.db_cluster.node_to_upgrade = self.db_cluster.nodes[indexes[0]]
             self.log.info('Upgrade Node %s begin', self.db_cluster.node_to_upgrade.name)
             self.upgrade_node(self.db_cluster.node_to_upgrade)
             self.log.info('Upgrade Node %s ended', self.db_cluster.node_to_upgrade.name)
             self.db_cluster.node_to_upgrade.check_node_health()
-            self.fill_and_verify_db_data('after upgraded %s' % self.db_cluster.node_to_upgrade.name)
 
-        # wait for the 80m read workload to finish
-        self.verify_stress_thread(read_80m_cs_thread_pool)
+            # wait for the prepare write workload to finish
+            self.verify_stress_thread(prepare_write_cs_thread_pool)
 
-        self.verify_stress_thread(entire_write_cs_thread_pool)
+            # read workload (cl=QUORUM)
+            self.log.info('Starting c-s read workload (cl=QUORUM n=10000000)')
+            stress_cmd_read_cl_quorum = self.params.get('stress_cmd_read_cl_quorum')
+            read_stress_queue = self.run_stress_thread(stress_cmd=stress_cmd_read_cl_quorum)
+            # wait for the read workload to finish
+            self.verify_stress_thread(read_stress_queue)
+            self.fill_and_verify_db_data('after upgraded one node')
 
-        # figure out what is the last supported sstable version
-        self.expected_sstable_format_version = self.get_highest_supported_sstable_version()
+            # read workload
+            self.log.info('Starting c-s read workload for 10m')
+            stress_cmd_read_10m = self.params.get('stress_cmd_read_10m')
+            read_10m_cs_thread_pool = self.run_stress_thread(stress_cmd=stress_cmd_read_10m)
 
-        # run 'nodetool upgradesstables' on all nodes and check/wait for all file to be upgraded
-        upgradesstables_available = self.db_cluster.run_func_parallel(func=self.upgradesstables_if_command_available)
+            self.log.info('Sleeping for 60s to let cassandra-stress start before the upgrade...')
+            time.sleep(60)
 
-        # only check sstable format version if all nodes had 'nodetool upgradesstables' available
-        if all(upgradesstables_available):
-            tables_upgraded = self.db_cluster.run_func_parallel(func=self.wait_for_sstable_upgrade)
-            assert all(tables_upgraded), "Some nodes failed to upgrade the sstable format {}".format(tables_upgraded)
+            # upgrade second node
+            self.db_cluster.node_to_upgrade = self.db_cluster.nodes[indexes[1]]
+            self.log.info('Upgrade Node %s begin', self.db_cluster.node_to_upgrade.name)
+            self.upgrade_node(self.db_cluster.node_to_upgrade)
+            self.log.info('Upgrade Node %s ended', self.db_cluster.node_to_upgrade.name)
+            self.db_cluster.node_to_upgrade.check_node_health()
 
-        verify_stress_after_cluster_upgrade = self.params.get(  # pylint: disable=invalid-name
-            'verify_stress_after_cluster_upgrade')
-        verify_stress_cs_thread_pool = self.run_stress_thread(stress_cmd=verify_stress_after_cluster_upgrade)
-        self.verify_stress_thread(verify_stress_cs_thread_pool)
+            # wait for the 10m read workload to finish
+            self.verify_stress_thread(read_10m_cs_thread_pool)
+            self.fill_and_verify_db_data('after upgraded two nodes')
 
-        # complex workload: verify data by simple read cl=ALL
-        self.log.info('Starting c-s complex workload to verify data by simple read')
-        stress_cmd_complex_verify_read = self.params.get('stress_cmd_complex_verify_read')
-        complex_cs_thread_pool = self.run_stress_thread(
-            stress_cmd=stress_cmd_complex_verify_read, profile='data_dir/complex_schema.yaml')
-        # wait for the read complex workload to finish
-        self.verify_stress_thread(complex_cs_thread_pool)
+            # read workload (80m)
+            self.log.info('Starting c-s read workload for 80m')
+            stress_cmd_read_80m = self.params.get('stress_cmd_read_80m')
+            read_80m_cs_thread_pool = self.run_stress_thread(stress_cmd=stress_cmd_read_80m)
+            self.log.info('Sleeping for 60s to let cassandra-stress start before the rollback...')
+            time.sleep(60)
 
-        # After adjusted the workloads, there is a entire write workload, and it uses a fixed duration for catching the data lose.
-        # But the execute time of workloads are not exact, so let only use basic prepare write & read verify for complex workloads,
-        # and comment two complex workloads.
-        #
-        # TODO: retest commented workloads and decide to enable or delete them.
-        #
-        # complex workload: verify data by multiple ops
-        #self.log.info('Starting c-s complex workload to verify data by multiple ops')
-        #stress_cmd_complex_verify_more = self.params.get('stress_cmd_complex_verify_more')
-        #complex_cs_thread_pool = self.run_stress_thread(stress_cmd=stress_cmd_complex_verify_more, profile='data_dir/complex_schema.yaml')
+            # rollback second node
+            self.log.info('Rollback Node %s begin', self.db_cluster.nodes[indexes[1]].name)
+            self.rollback_node(self.db_cluster.nodes[indexes[1]])
+            self.log.info('Rollback Node %s ended', self.db_cluster.nodes[indexes[1]].name)
+            self.db_cluster.nodes[indexes[1]].check_node_health()
 
-        # wait for the complex workload to finish
-        # self.verify_stress_thread(complex_cs_thread_pool)
+            self.fill_and_verify_db_data('after rollback the second node')
 
-        # complex workload: verify data by delete 1/10 data
-        #self.log.info('Starting c-s complex workload to verify data by delete')
-        #stress_cmd_complex_verify_delete = self.params.get('stress_cmd_complex_verify_delete')
-        #complex_cs_thread_pool = self.run_stress_thread(stress_cmd=stress_cmd_complex_verify_delete, profile='data_dir/complex_schema.yaml')
+            for i in indexes[1:]:
+                self.db_cluster.node_to_upgrade = self.db_cluster.nodes[i]
+                self.log.info('Upgrade Node %s begin', self.db_cluster.node_to_upgrade.name)
+                self.upgrade_node(self.db_cluster.node_to_upgrade)
+                self.log.info('Upgrade Node %s ended', self.db_cluster.node_to_upgrade.name)
+                self.db_cluster.node_to_upgrade.check_node_health()
+                self.fill_and_verify_db_data('after upgraded %s' % self.db_cluster.node_to_upgrade.name)
 
-        # wait for the complex workload to finish
-        # self.verify_stress_thread(complex_cs_thread_pool)
+            # wait for the 80m read workload to finish
+            self.verify_stress_thread(read_80m_cs_thread_pool)
+
+            self.verify_stress_thread(entire_write_cs_thread_pool)
+
+            # figure out what is the last supported sstable version
+            self.expected_sstable_format_version = self.get_highest_supported_sstable_version()
+
+            # run 'nodetool upgradesstables' on all nodes and check/wait for all file to be upgraded
+            upgradesstables_available = self.db_cluster.run_func_parallel(
+                func=self.upgradesstables_if_command_available)
+
+            # only check sstable format version if all nodes had 'nodetool upgradesstables' available
+            if all(upgradesstables_available):
+                tables_upgraded = self.db_cluster.run_func_parallel(func=self.wait_for_sstable_upgrade)
+                assert all(tables_upgraded), "Some nodes failed to upgrade the sstable format {}".format(tables_upgraded)
+
+            verify_stress_after_cluster_upgrade = self.params.get(  # pylint: disable=invalid-name
+                'verify_stress_after_cluster_upgrade')
+            verify_stress_cs_thread_pool = self.run_stress_thread(stress_cmd=verify_stress_after_cluster_upgrade)
+            self.verify_stress_thread(verify_stress_cs_thread_pool)
+
+            # complex workload: verify data by simple read cl=ALL
+            self.log.info('Starting c-s complex workload to verify data by simple read')
+            stress_cmd_complex_verify_read = self.params.get('stress_cmd_complex_verify_read')
+            complex_cs_thread_pool = self.run_stress_thread(
+                stress_cmd=stress_cmd_complex_verify_read, profile='data_dir/complex_schema.yaml')
+            # wait for the read complex workload to finish
+            self.verify_stress_thread(complex_cs_thread_pool)
+
+            # After adjusted the workloads, there is a entire write workload, and it uses a fixed duration for catching the data lose.
+            # But the execute time of workloads are not exact, so let only use basic prepare write & read verify for complex workloads,
+            # and comment two complex workloads.
+            #
+            # TODO: retest commented workloads and decide to enable or delete them.
+            #
+            # complex workload: verify data by multiple ops
+            #self.log.info('Starting c-s complex workload to verify data by multiple ops')
+            #stress_cmd_complex_verify_more = self.params.get('stress_cmd_complex_verify_more')
+            #complex_cs_thread_pool = self.run_stress_thread(stress_cmd=stress_cmd_complex_verify_more, profile='data_dir/complex_schema.yaml')
+
+            # wait for the complex workload to finish
+            # self.verify_stress_thread(complex_cs_thread_pool)
+
+            # complex workload: verify data by delete 1/10 data
+            #self.log.info('Starting c-s complex workload to verify data by delete')
+            #stress_cmd_complex_verify_delete = self.params.get('stress_cmd_complex_verify_delete')
+            #complex_cs_thread_pool = self.run_stress_thread(stress_cmd=stress_cmd_complex_verify_delete, profile='data_dir/complex_schema.yaml')
+
+            # wait for the complex workload to finish
+            # self.verify_stress_thread(complex_cs_thread_pool)
 
         error_factor = 3
         schema_load_error_num = 0
