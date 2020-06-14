@@ -1064,11 +1064,11 @@ class BaseNode(object):  # pylint: disable=too-many-instance-attributes,too-many
     def destroy(self):
         raise NotImplementedError('Derived classes must implement destroy')
 
-    def wait_ssh_up(self, verbose=True, timeout=500):
+    def wait_ssh_up(self, verbose=True, timeout=700):
         text = None
         if verbose:
             text = '%s: Waiting for SSH to be up' % self
-        wait.wait_for(func=self.remoter.is_up, step=10, text=text, timeout=timeout, throw_exc=True)
+        wait.wait_for(func=self.remoter.is_up, step=20, text=text, timeout=timeout, throw_exc=True)
 
     def is_port_used(self, port, service_name):
         try:
