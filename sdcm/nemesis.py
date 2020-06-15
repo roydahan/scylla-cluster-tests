@@ -668,23 +668,27 @@ class Nemesis():  # pylint: disable=too-many-instance-attributes,too-many-public
         disrupt_methods = [attr[1] for attr in inspect.getmembers(self) if
                            attr[0] in disrupt_methods and
                            callable(attr[1])]
-        disrupt_methods = sorted(disrupt_methods * num_of_nemesis_repeats) * num_of_sequence_repeats
 
-        for disrupt_method in disrupt_methods:
-            disrupt_method_name = disrupt_method.__name__.replace('disrupt_', '')
-            self.log.info(">>>>>>>>>>>>>Started random_disrupt_method %s" % disrupt_method_name)
-            self.metrics_srv.event_start(disrupt_method_name)
-            try:
-                disrupt_method()
-            except Exception as exc:  # pylint: disable=broad-except
-                error_msg = "Exception in random_disrupt_method %s: %s", disrupt_method_name, exc
-                self.log.error(error_msg)
-                self.error_list.append(error_msg)
-                raise
-            else:
-                self.log.info("<<<<<<<<<<<<<Finished random_disrupt_method %s" % disrupt_method_name)
-            finally:
-                self.metrics_srv.event_stop(disrupt_method_name)
+        random.shuffle(disrupt_methods)
+
+        for i in range(0, num_of_sequence_repeats):
+            self.log.info(f"Executing Nemesis Sequence Number {i}")
+            for disrupt_method in disrupt_methods:
+                for j in range(0, num_of_nemesis_repeats):
+                    disrupt_method_name = disrupt_method.__name__.replace('disrupt_', '')
+                    self.log.info(">>>>>>>>>>>>>Started random_disrupt_method %s" % disrupt_method_name)
+                    self.metrics_srv.event_start(disrupt_method_name)
+                    try:
+                        disrupt_method()
+                    except Exception as exc:  # pylint: disable=broad-except
+                        error_msg = "Exception in random_disrupt_method %s: %s", disrupt_method_name, exc
+                        self.log.error(error_msg)
+                        self.error_list.append(error_msg)
+                        raise
+                    else:
+                        self.log.info("<<<<<<<<<<<<<Finished random_disrupt_method %s" % disrupt_method_name)
+                    finally:
+                        self.metrics_srv.event_stop(disrupt_method_name)
 
     def repair_nodetool_repair(self, node=None):
         node = node if node else self.target_node
