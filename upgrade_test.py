@@ -432,6 +432,239 @@ class UpgradeTest(FillDatabaseData):
                                          'Found error: index special column "idx_token" is not recognized' %
                                          (node.name, step))
 
+    # def test_rolling_upgrade(self):  # pylint: disable=too-many-locals,too-many-statements
+    #     """
+    #     Upgrade half of nodes in the cluster, and start special read workload
+    #     during the stage. Checksum method is changed to xxhash from Scylla 2.2,
+    #     we want to use this case to verify the read (cl=ALL) workload works
+    #     well, upgrade all nodes to new version in the end.
+    #     """
+    #     # In case the target version >= 3.1 we need to perform test for truncate entries
+    #     target_upgrade_version = self.params.get('target_upgrade_version', default='')
+    #     self.truncate_entries_flag = False
+    #     if target_upgrade_version and parse_version(target_upgrade_version) >= parse_version('3.1') and \
+    #             not is_enterprise(target_upgrade_version):
+    #         self.truncate_entries_flag = True
+    #
+    #     self.log.info('pre-test - prepare test keyspaces and tables')
+    #     # prepare test keyspaces and tables before upgrade to avoid schema change during mixed cluster.
+    #     self.prepare_keyspaces_and_tables()
+    #     self.fill_and_verify_db_data('BEFORE UPGRADE', pre_fill=True)
+    #
+    #     # write workload during entire test
+    #     self.log.info('Starting c-s write workload during entire test')
+    #     write_stress_during_entire_test = self.params.get('write_stress_during_entire_test')
+    #     entire_write_cs_thread_pool = self.run_stress_thread(stress_cmd=write_stress_during_entire_test)
+    #
+    #     # Let to write_stress_during_entire_test complete the schema changes
+    #     time.sleep(300)
+    #
+    #     # Prepare keyspace and tables for truncate test
+    #     if self.truncate_entries_flag:
+    #         self.insert_rows = 10
+    #         self.fill_db_data_for_truncate_test(insert_rows=self.insert_rows)
+    #
+    #     # generate random order to upgrade
+    #     nodes_num = len(self.db_cluster.nodes)
+    #     # prepare an array containing the indexes
+    #     indexes = list(range(nodes_num))
+    #     # shuffle it so we will upgrade the nodes in a random order
+    #     random.shuffle(indexes)
+    #
+    #     self.log.info('pre-test - Run stress workload before upgrade')
+    #     # complex workload: prepare write
+    #     self.log.info('Starting c-s complex workload (5M) to prepare data')
+    #     stress_cmd_complex_prepare = self.params.get('stress_cmd_complex_prepare')
+    #     complex_cs_thread_pool = self.run_stress_thread(
+    #         stress_cmd=stress_cmd_complex_prepare, profile='data_dir/complex_schema.yaml')
+    #
+    #     # wait for the complex workload to finish
+    #     self.verify_stress_thread(complex_cs_thread_pool)
+    #
+    #     # prepare write workload
+    #     self.log.info('Starting c-s prepare write workload (n=10000000)')
+    #     prepare_write_stress = self.params.get('prepare_write_stress')
+    #     prepare_write_cs_thread_pool = self.run_stress_thread(stress_cmd=prepare_write_stress)
+    #     self.log.info('Sleeping for 60s to let cassandra-stress start before the upgrade...')
+    #     time.sleep(60)
+    #
+    #     with ignore_upgrade_schema_errors():
+    #
+    #         step = 'Step1 - Upgrade First Node '
+    #         self.log.info(step)
+    #         # upgrade first node
+    #         self.db_cluster.node_to_upgrade = self.db_cluster.nodes[indexes[0]]
+    #         self.log.info('Upgrade Node %s begin', self.db_cluster.node_to_upgrade.name)
+    #         self.upgrade_node(self.db_cluster.node_to_upgrade)
+    #         self.log.info('Upgrade Node %s ended', self.db_cluster.node_to_upgrade.name)
+    #         self.db_cluster.node_to_upgrade.check_node_health()
+    #
+    #         # wait for the prepare write workload to finish
+    #         self.verify_stress_thread(prepare_write_cs_thread_pool)
+    #
+    #         # read workload (cl=QUORUM)
+    #         self.log.info('Starting c-s read workload (cl=QUORUM n=10000000)')
+    #         stress_cmd_read_cl_quorum = self.params.get('stress_cmd_read_cl_quorum')
+    #         read_stress_queue = self.run_stress_thread(stress_cmd=stress_cmd_read_cl_quorum)
+    #         # wait for the read workload to finish
+    #         self.verify_stress_thread(read_stress_queue)
+    #         self.fill_and_verify_db_data('after upgraded one node')
+    #         self.search_for_idx_token_error_after_upgrade(node=self.db_cluster.node_to_upgrade,
+    #                                                       step=step+' - after upgraded one node')
+    #
+    #         # read workload
+    #         self.log.info('Starting c-s read workload for 10m')
+    #         stress_cmd_read_10m = self.params.get('stress_cmd_read_10m')
+    #         read_10m_cs_thread_pool = self.run_stress_thread(stress_cmd=stress_cmd_read_10m)
+    #
+    #         self.log.info('Sleeping for 60s to let cassandra-stress start before the upgrade...')
+    #         time.sleep(60)
+    #
+    #         step = 'Step2 - Upgrade Second Node '
+    #         self.log.info(step)
+    #         # upgrade second node
+    #         self.db_cluster.node_to_upgrade = self.db_cluster.nodes[indexes[1]]
+    #         self.log.info('Upgrade Node %s begin', self.db_cluster.node_to_upgrade.name)
+    #         self.upgrade_node(self.db_cluster.node_to_upgrade)
+    #         self.log.info('Upgrade Node %s ended', self.db_cluster.node_to_upgrade.name)
+    #         self.db_cluster.node_to_upgrade.check_node_health()
+    #
+    #         # wait for the 10m read workload to finish
+    #         self.verify_stress_thread(read_10m_cs_thread_pool)
+    #         self.fill_and_verify_db_data('after upgraded two nodes')
+    #         self.search_for_idx_token_error_after_upgrade(node=self.db_cluster.node_to_upgrade,
+    #                                                       step=step+' - after upgraded two nodes')
+    #
+    #         # read workload (60m)
+    #         self.log.info('Starting c-s read workload for 60m')
+    #         stress_cmd_read_60m = self.params.get('stress_cmd_read_60m')
+    #         read_60m_cs_thread_pool = self.run_stress_thread(stress_cmd=stress_cmd_read_60m)
+    #         self.log.info('Sleeping for 60s to let cassandra-stress start before the rollback...')
+    #         time.sleep(60)
+    #
+    #         self.log.info('Step3 - Rollback Second Node ')
+    #         # rollback second node
+    #         self.log.info('Rollback Node %s begin', self.db_cluster.nodes[indexes[1]].name)
+    #         self.rollback_node(self.db_cluster.nodes[indexes[1]])
+    #         self.log.info('Rollback Node %s ended', self.db_cluster.nodes[indexes[1]].name)
+    #         self.db_cluster.nodes[indexes[1]].check_node_health()
+    #
+    #     step = 'Step4 - Verify data during mixed cluster mode '
+    #     self.log.info(step)
+    #     self.fill_and_verify_db_data('after rollback the second node')
+    #     self.log.info('Repair the first upgraded Node')
+    #     self.db_cluster.nodes[indexes[0]].run_nodetool(sub_cmd='repair')
+    #     self.search_for_idx_token_error_after_upgrade(node=self.db_cluster.node_to_upgrade,
+    #                                                   step=step)
+    #
+    #     with ignore_upgrade_schema_errors():
+    #
+    #         step = 'Step5 - Upgrade rest of the Nodes '
+    #         self.log.info(step)
+    #         for i in indexes[1:]:
+    #             self.db_cluster.node_to_upgrade = self.db_cluster.nodes[i]
+    #             self.log.info('Upgrade Node %s begin', self.db_cluster.node_to_upgrade.name)
+    #             self.upgrade_node(self.db_cluster.node_to_upgrade)
+    #             self.log.info('Upgrade Node %s ended', self.db_cluster.node_to_upgrade.name)
+    #             self.db_cluster.node_to_upgrade.check_node_health()
+    #             self.fill_and_verify_db_data('after upgraded %s' % self.db_cluster.node_to_upgrade.name)
+    #             self.search_for_idx_token_error_after_upgrade(node=self.db_cluster.node_to_upgrade,
+    #                                                           step=step)
+    #
+    #     self.log.info('Step6 - Verify stress results after upgrade ')
+    #     self.log.info('Waiting for stress threads to complete after upgrade')
+    #     # wait for the 60m read workload to finish
+    #     self.verify_stress_thread(read_60m_cs_thread_pool)
+    #
+    #     self.verify_stress_thread(entire_write_cs_thread_pool)
+    #
+    #     self.log.info('Step7 - Upgrade sstables to latest supported version ')
+    #     # figure out what is the last supported sstable version
+    #     self.expected_sstable_format_version = self.get_highest_supported_sstable_version()
+    #
+    #     # run 'nodetool upgradesstables' on all nodes and check/wait for all file to be upgraded
+    #     upgradesstables = self.db_cluster.run_func_parallel(func=self.upgradesstables_if_command_available)
+    #
+    #     # only check sstable format version if all nodes had 'nodetool upgradesstables' available
+    #     if all(upgradesstables):
+    #         self.log.info('Upgrading sstables if new version is available')
+    #         tables_upgraded = self.db_cluster.run_func_parallel(func=self.wait_for_sstable_upgrade)
+    #         assert all(tables_upgraded), "Failed to upgrade the sstable format {}".format(tables_upgraded)
+    #
+    #     # Verify sstabledump
+    #     self.log.info('Starting sstabledump to verify correctness of sstables')
+    #     self.db_cluster.nodes[0].remoter.run(
+    #         'for i in `sudo find /var/lib/scylla/data/keyspace_complex/ -type f |grep -v manifest.json |'
+    #         'grep -v snapshots |head -n 1`; do echo $i; sudo sstabledump $i 1>/tmp/sstabledump.output || '
+    #         'exit 1; done', verbose=True)
+    #
+    #     self.log.info('Step8 - Run stress and verify after upgrading entire cluster ')
+    #     self.log.info('Starting verify_stress_after_cluster_upgrade')
+    #     verify_stress_after_cluster_upgrade = self.params.get(  # pylint: disable=invalid-name
+    #         'verify_stress_after_cluster_upgrade')
+    #     verify_stress_cs_thread_pool = self.run_stress_thread(stress_cmd=verify_stress_after_cluster_upgrade)
+    #     self.verify_stress_thread(verify_stress_cs_thread_pool)
+    #
+    #     # complex workload: verify data by simple read cl=ALL
+    #     self.log.info('Starting c-s complex workload to verify data by simple read')
+    #     stress_cmd_complex_verify_read = self.params.get('stress_cmd_complex_verify_read')
+    #     complex_cs_thread_pool = self.run_stress_thread(
+    #         stress_cmd=stress_cmd_complex_verify_read, profile='data_dir/complex_schema.yaml')
+    #     # wait for the read complex workload to finish
+    #     self.verify_stress_thread(complex_cs_thread_pool)
+    #
+    #     # After adjusted the workloads, there is a entire write workload, and it uses a fixed duration for catching
+    #     # the data lose.
+    #     # But the execute time of workloads are not exact, so let only use basic prepare write & read verify for
+    #     # complex workloads,and comment two complex workloads.
+    #     #
+    #     # TODO: retest commented workloads and decide to enable or delete them.
+    #     #
+    #     # complex workload: verify data by multiple ops
+    #     # self.log.info('Starting c-s complex workload to verify data by multiple ops')
+    #     # stress_cmd_complex_verify_more = self.params.get('stress_cmd_complex_verify_more')
+    #     # complex_cs_thread_pool = self.run_stress_thread(stress_cmd=stress_cmd_complex_verify_more,
+    #     #                                                profile='data_dir/complex_schema.yaml')
+    #
+    #     # wait for the complex workload to finish
+    #     # self.verify_stress_thread(complex_cs_thread_pool)
+    #
+    #     # complex workload: verify data by delete 1/10 data
+    #     # self.log.info('Starting c-s complex workload to verify data by delete')
+    #     # stress_cmd_complex_verify_delete = self.params.get('stress_cmd_complex_verify_delete')
+    #     # complex_cs_thread_pool = self.run_stress_thread(stress_cmd=stress_cmd_complex_verify_delete,
+    #     #                                                profile='data_dir/complex_schema.yaml')
+    #     # wait for the complex workload to finish
+    #     # self.verify_stress_thread(complex_cs_thread_pool)
+    #
+    #     # During the test we filter and ignore some specific errors, but we want to allow only certain amount of them
+    #     step = 'Step9 - Search for errors that we filter during the test '
+    #     self.log.info(step)
+    #     self.log.info('Checking how many failed_to_load_schem errors happened during the test')
+    #     error_factor = 3
+    #     schema_load_error_num = self.count_log_errors(search_pattern='Failed to load schema version',
+    #                                                   step=step)
+    #     # Warning example:
+    #     # workload prioritization - update_service_levels_from_distributed_data: an error occurred while retrieving
+    #     # configuration (exceptions::read_failure_exception (Operation failed for system_distributed.service_levels
+    #     # - received 0 responses and 1 failures from 1 CL=ONE.))
+    #     workload_prioritization_error_num = self.count_log_errors(search_pattern='workload prioritization.*read_failure_exception',
+    #                                                               step=step, search_for_idx_token_error=False)
+    #
+    #     self.log.info(f'schema_load_error_num: {schema_load_error_num}; '
+    #                   f'workload_prioritization_error_num: {workload_prioritization_error_num}')
+    #
+    #     # Issue #https://github.com/scylladb/scylla-enterprise/issues/1391
+    #     # By Eliran's comment: For 'Failed to load schema version' error which is expected and non offensive is
+    #     # to count the 'workload prioritization' warning and subtract that amount from the amount of overall errors.
+    #     load_error_num = schema_load_error_num-workload_prioritization_error_num
+    #     assert load_error_num <= error_factor * 8 * \
+    #         len(self.db_cluster.nodes), 'Only allowing shards_num * %d schema load errors per host during the ' \
+    #                                     'entire test, actual: %d' % (
+    #             error_factor, schema_load_error_num)
+    #
+    #     self.log.info('all nodes were upgraded, and last workaround is verified.')
+
     def test_rolling_upgrade(self):  # pylint: disable=too-many-locals,too-many-statements
         """
         Upgrade half of nodes in the cluster, and start special read workload
@@ -446,24 +679,6 @@ class UpgradeTest(FillDatabaseData):
                 not is_enterprise(target_upgrade_version):
             self.truncate_entries_flag = True
 
-        self.log.info('pre-test - prepare test keyspaces and tables')
-        # prepare test keyspaces and tables before upgrade to avoid schema change during mixed cluster.
-        self.prepare_keyspaces_and_tables()
-        self.fill_and_verify_db_data('BEFORE UPGRADE', pre_fill=True)
-
-        # write workload during entire test
-        self.log.info('Starting c-s write workload during entire test')
-        write_stress_during_entire_test = self.params.get('write_stress_during_entire_test')
-        entire_write_cs_thread_pool = self.run_stress_thread(stress_cmd=write_stress_during_entire_test)
-
-        # Let to write_stress_during_entire_test complete the schema changes
-        time.sleep(300)
-
-        # Prepare keyspace and tables for truncate test
-        if self.truncate_entries_flag:
-            self.insert_rows = 10
-            self.fill_db_data_for_truncate_test(insert_rows=self.insert_rows)
-
         # generate random order to upgrade
         nodes_num = len(self.db_cluster.nodes)
         # prepare an array containing the indexes
@@ -471,22 +686,20 @@ class UpgradeTest(FillDatabaseData):
         # shuffle it so we will upgrade the nodes in a random order
         random.shuffle(indexes)
 
-        self.log.info('pre-test - Run stress workload before upgrade')
-        # complex workload: prepare write
-        self.log.info('Starting c-s complex workload (5M) to prepare data')
-        stress_cmd_complex_prepare = self.params.get('stress_cmd_complex_prepare')
-        complex_cs_thread_pool = self.run_stress_thread(
-            stress_cmd=stress_cmd_complex_prepare, profile='data_dir/complex_schema.yaml')
-
-        # wait for the complex workload to finish
-        self.verify_stress_thread(complex_cs_thread_pool)
-
         # prepare write workload
-        self.log.info('Starting c-s prepare write workload (n=10000000)')
+        self.log.info('Starting c-s prepare write workload')
         prepare_write_stress = self.params.get('prepare_write_stress')
         prepare_write_cs_thread_pool = self.run_stress_thread(stress_cmd=prepare_write_stress)
-        self.log.info('Sleeping for 60s to let cassandra-stress start before the upgrade...')
-        time.sleep(60)
+
+        self.log.info('Waiting for prepare-write to finish')
+        self.verify_stress_thread(prepare_write_cs_thread_pool)
+
+        # read workload (60m)
+        self.log.info('Starting c-s read workload for 60m')
+        stress_cmd_read_60m = self.params.get('stress_cmd_read_60m')
+        read_60m_cs_thread_pool = self.run_stress_thread(stress_cmd=stress_cmd_read_60m)
+        self.log.info('Sleeping for 60s to let cassandra-stress start before the rollback...')
+        time.sleep(600)
 
         with ignore_upgrade_schema_errors():
 
@@ -499,27 +712,6 @@ class UpgradeTest(FillDatabaseData):
             self.log.info('Upgrade Node %s ended', self.db_cluster.node_to_upgrade.name)
             self.db_cluster.node_to_upgrade.check_node_health()
 
-            # wait for the prepare write workload to finish
-            self.verify_stress_thread(prepare_write_cs_thread_pool)
-
-            # read workload (cl=QUORUM)
-            self.log.info('Starting c-s read workload (cl=QUORUM n=10000000)')
-            stress_cmd_read_cl_quorum = self.params.get('stress_cmd_read_cl_quorum')
-            read_stress_queue = self.run_stress_thread(stress_cmd=stress_cmd_read_cl_quorum)
-            # wait for the read workload to finish
-            self.verify_stress_thread(read_stress_queue)
-            self.fill_and_verify_db_data('after upgraded one node')
-            self.search_for_idx_token_error_after_upgrade(node=self.db_cluster.node_to_upgrade,
-                                                          step=step+' - after upgraded one node')
-
-            # read workload
-            self.log.info('Starting c-s read workload for 10m')
-            stress_cmd_read_10m = self.params.get('stress_cmd_read_10m')
-            read_10m_cs_thread_pool = self.run_stress_thread(stress_cmd=stress_cmd_read_10m)
-
-            self.log.info('Sleeping for 60s to let cassandra-stress start before the upgrade...')
-            time.sleep(60)
-
             step = 'Step2 - Upgrade Second Node '
             self.log.info(step)
             # upgrade second node
@@ -529,19 +721,6 @@ class UpgradeTest(FillDatabaseData):
             self.log.info('Upgrade Node %s ended', self.db_cluster.node_to_upgrade.name)
             self.db_cluster.node_to_upgrade.check_node_health()
 
-            # wait for the 10m read workload to finish
-            self.verify_stress_thread(read_10m_cs_thread_pool)
-            self.fill_and_verify_db_data('after upgraded two nodes')
-            self.search_for_idx_token_error_after_upgrade(node=self.db_cluster.node_to_upgrade,
-                                                          step=step+' - after upgraded two nodes')
-
-            # read workload (60m)
-            self.log.info('Starting c-s read workload for 60m')
-            stress_cmd_read_60m = self.params.get('stress_cmd_read_60m')
-            read_60m_cs_thread_pool = self.run_stress_thread(stress_cmd=stress_cmd_read_60m)
-            self.log.info('Sleeping for 60s to let cassandra-stress start before the rollback...')
-            time.sleep(60)
-
             self.log.info('Step3 - Rollback Second Node ')
             # rollback second node
             self.log.info('Rollback Node %s begin', self.db_cluster.nodes[indexes[1]].name)
@@ -549,17 +728,7 @@ class UpgradeTest(FillDatabaseData):
             self.log.info('Rollback Node %s ended', self.db_cluster.nodes[indexes[1]].name)
             self.db_cluster.nodes[indexes[1]].check_node_health()
 
-        step = 'Step4 - Verify data during mixed cluster mode '
-        self.log.info(step)
-        self.fill_and_verify_db_data('after rollback the second node')
-        self.log.info('Repair the first upgraded Node')
-        self.db_cluster.nodes[indexes[0]].run_nodetool(sub_cmd='repair')
-        self.search_for_idx_token_error_after_upgrade(node=self.db_cluster.node_to_upgrade,
-                                                      step=step)
-
-        with ignore_upgrade_schema_errors():
-
-            step = 'Step5 - Upgrade rest of the Nodes '
+            step = 'Step4 - Upgrade rest of the Nodes '
             self.log.info(step)
             for i in indexes[1:]:
                 self.db_cluster.node_to_upgrade = self.db_cluster.nodes[i]
@@ -567,101 +736,15 @@ class UpgradeTest(FillDatabaseData):
                 self.upgrade_node(self.db_cluster.node_to_upgrade)
                 self.log.info('Upgrade Node %s ended', self.db_cluster.node_to_upgrade.name)
                 self.db_cluster.node_to_upgrade.check_node_health()
-                self.fill_and_verify_db_data('after upgraded %s' % self.db_cluster.node_to_upgrade.name)
                 self.search_for_idx_token_error_after_upgrade(node=self.db_cluster.node_to_upgrade,
                                                               step=step)
 
-        self.log.info('Step6 - Verify stress results after upgrade ')
-        self.log.info('Waiting for stress threads to complete after upgrade')
-        # wait for the 60m read workload to finish
-        self.verify_stress_thread(read_60m_cs_thread_pool)
-
-        self.verify_stress_thread(entire_write_cs_thread_pool)
-
-        self.log.info('Step7 - Upgrade sstables to latest supported version ')
-        # figure out what is the last supported sstable version
-        self.expected_sstable_format_version = self.get_highest_supported_sstable_version()
-
-        # run 'nodetool upgradesstables' on all nodes and check/wait for all file to be upgraded
-        upgradesstables = self.db_cluster.run_func_parallel(func=self.upgradesstables_if_command_available)
-
-        # only check sstable format version if all nodes had 'nodetool upgradesstables' available
-        if all(upgradesstables):
-            self.log.info('Upgrading sstables if new version is available')
-            tables_upgraded = self.db_cluster.run_func_parallel(func=self.wait_for_sstable_upgrade)
-            assert all(tables_upgraded), "Failed to upgrade the sstable format {}".format(tables_upgraded)
-
-        # Verify sstabledump
-        self.log.info('Starting sstabledump to verify correctness of sstables')
-        self.db_cluster.nodes[0].remoter.run(
-            'for i in `sudo find /var/lib/scylla/data/keyspace_complex/ -type f |grep -v manifest.json |'
-            'grep -v snapshots |head -n 1`; do echo $i; sudo sstabledump $i 1>/tmp/sstabledump.output || '
-            'exit 1; done', verbose=True)
-
-        self.log.info('Step8 - Run stress and verify after upgrading entire cluster ')
+        self.log.info('Step5 - Run stress and verify after upgrading entire cluster ')
         self.log.info('Starting verify_stress_after_cluster_upgrade')
         verify_stress_after_cluster_upgrade = self.params.get(  # pylint: disable=invalid-name
             'verify_stress_after_cluster_upgrade')
         verify_stress_cs_thread_pool = self.run_stress_thread(stress_cmd=verify_stress_after_cluster_upgrade)
         self.verify_stress_thread(verify_stress_cs_thread_pool)
-
-        # complex workload: verify data by simple read cl=ALL
-        self.log.info('Starting c-s complex workload to verify data by simple read')
-        stress_cmd_complex_verify_read = self.params.get('stress_cmd_complex_verify_read')
-        complex_cs_thread_pool = self.run_stress_thread(
-            stress_cmd=stress_cmd_complex_verify_read, profile='data_dir/complex_schema.yaml')
-        # wait for the read complex workload to finish
-        self.verify_stress_thread(complex_cs_thread_pool)
-
-        # After adjusted the workloads, there is a entire write workload, and it uses a fixed duration for catching
-        # the data lose.
-        # But the execute time of workloads are not exact, so let only use basic prepare write & read verify for
-        # complex workloads,and comment two complex workloads.
-        #
-        # TODO: retest commented workloads and decide to enable or delete them.
-        #
-        # complex workload: verify data by multiple ops
-        # self.log.info('Starting c-s complex workload to verify data by multiple ops')
-        # stress_cmd_complex_verify_more = self.params.get('stress_cmd_complex_verify_more')
-        # complex_cs_thread_pool = self.run_stress_thread(stress_cmd=stress_cmd_complex_verify_more,
-        #                                                profile='data_dir/complex_schema.yaml')
-
-        # wait for the complex workload to finish
-        # self.verify_stress_thread(complex_cs_thread_pool)
-
-        # complex workload: verify data by delete 1/10 data
-        # self.log.info('Starting c-s complex workload to verify data by delete')
-        # stress_cmd_complex_verify_delete = self.params.get('stress_cmd_complex_verify_delete')
-        # complex_cs_thread_pool = self.run_stress_thread(stress_cmd=stress_cmd_complex_verify_delete,
-        #                                                profile='data_dir/complex_schema.yaml')
-        # wait for the complex workload to finish
-        # self.verify_stress_thread(complex_cs_thread_pool)
-
-        # During the test we filter and ignore some specific errors, but we want to allow only certain amount of them
-        step = 'Step9 - Search for errors that we filter during the test '
-        self.log.info(step)
-        self.log.info('Checking how many failed_to_load_schem errors happened during the test')
-        error_factor = 3
-        schema_load_error_num = self.count_log_errors(search_pattern='Failed to load schema version',
-                                                      step=step)
-        # Warning example:
-        # workload prioritization - update_service_levels_from_distributed_data: an error occurred while retrieving
-        # configuration (exceptions::read_failure_exception (Operation failed for system_distributed.service_levels
-        # - received 0 responses and 1 failures from 1 CL=ONE.))
-        workload_prioritization_error_num = self.count_log_errors(search_pattern='workload prioritization.*read_failure_exception',
-                                                                  step=step, search_for_idx_token_error=False)
-
-        self.log.info(f'schema_load_error_num: {schema_load_error_num}; '
-                      f'workload_prioritization_error_num: {workload_prioritization_error_num}')
-
-        # Issue #https://github.com/scylladb/scylla-enterprise/issues/1391
-        # By Eliran's comment: For 'Failed to load schema version' error which is expected and non offensive is
-        # to count the 'workload prioritization' warning and subtract that amount from the amount of overall errors.
-        load_error_num = schema_load_error_num-workload_prioritization_error_num
-        assert load_error_num <= error_factor * 8 * \
-            len(self.db_cluster.nodes), 'Only allowing shards_num * %d schema load errors per host during the ' \
-                                        'entire test, actual: %d' % (
-                error_factor, schema_load_error_num)
 
         self.log.info('all nodes were upgraded, and last workaround is verified.')
 
