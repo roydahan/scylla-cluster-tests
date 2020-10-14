@@ -23,3 +23,4 @@ send_email: true
 email_recipients: ['qa@scylladb.com']
 
 update_db_packages: gs://scratch.scylladb.com/sct_test/gcc
+use_legacy_cluster_init: false
