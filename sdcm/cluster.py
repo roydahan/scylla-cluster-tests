@@ -3723,12 +3723,13 @@ class BaseScyllaCluster:  # pylint: disable=too-many-public-methods, too-many-in
         :return:
         """
         node_list = node_list or self.nodes
-        self.update_db_binary(node_list)
-        self.update_db_packages(node_list)
-        self.get_scylla_version()
 
         wait.wait_for(self.verify_logging_from_nodes, nodes_list=node_list,
                       text="wait for db logs", step=20, timeout=300, throw_exc=True)
+
+        self.update_db_binary(node_list)
+        self.update_db_packages(node_list)
+        self.get_scylla_version()
 
         self.log.info("{} nodes configured and stated.".format(node_list))
 
