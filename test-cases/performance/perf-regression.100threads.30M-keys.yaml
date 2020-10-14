@@ -22,4 +22,4 @@ store_perf_results: true
 send_email: true
 email_recipients: ['qa@scylladb.com']
 
-update_db_packages: gs://scratch.scylladb.com/sct_test/clang
+update_db_packages: gs://scratch.scylladb.com/sct_test/gcc
