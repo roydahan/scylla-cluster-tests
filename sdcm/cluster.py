@@ -1772,6 +1772,7 @@ class BaseNode(AutoSshContainerMixin, WebDriverContainerMixin):  # pylint: disab
         if append_scylla_args:
             self.log.debug("Append following args to scylla: `%s'", append_scylla_args)
             scylla_server_config = f"/etc/{'sysconfig' if self.distro.is_rhel_like else 'default'}/scylla-server"
+            append_scylla_args = append_scylla_args + f" --smp {random.randrange(start=3,stop=16)}"
             self.remoter.sudo(
                 f"sed -i '/{append_scylla_args}/! s/SCYLLA_ARGS=\"/&{append_scylla_args} /' {scylla_server_config}")
 
