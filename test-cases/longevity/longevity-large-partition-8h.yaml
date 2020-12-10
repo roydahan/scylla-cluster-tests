@@ -38,9 +38,10 @@ n_monitor_nodes: 1
 
 round_robin: true
 
-instance_type_db: 'i3.2xlarge'
+instance_type_db: 'i3.4xlarge'
 
-nemesis_class_name: 'ChaosMonkey'
+nemesis_class_name: 'GrowShrinkClusterNemesis'
+nemesis_add_node_cnt: 3
 nemesis_interval: 15
 
 user_prefix: 'longevity-large-partitions-8h'
