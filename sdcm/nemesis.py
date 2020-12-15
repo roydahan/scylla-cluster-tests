@@ -3204,13 +3204,13 @@ class SisyphusMonkey(Nemesis):
 #         self.disrupt_decommission_streaming_err()
 #
 #
-# class RebuildStreamingErrMonkey(Nemesis):
-#
-#     disruptive = True
-#
-#     @log_time_elapsed_and_status
-#     def disrupt(self):
-#         self.disrupt_rebuild_streaming_err()
+class RebuildStreamingErrMonkey(Nemesis):
+
+    disruptive = True
+
+    @log_time_elapsed_and_status
+    def disrupt(self):
+        self.disrupt_rebuild_streaming_err()
 #
 #
 # class RepairStreamingErrMonkey(Nemesis):
