@@ -23,3 +23,5 @@ send_email: true
 email_recipients: ['qa@scylladb.com']
 
 use_legacy_cluster_init: false
+
+update_db_packages: "s3://downloads.scylladb.com/rpm/unstable/centos/master/2020-12-03T12:39:30Z/scylla/x86_64/"
