@@ -3074,8 +3074,8 @@ class BaseScyllaCluster:  # pylint: disable=too-many-public-methods
             # replace the packages
             # node.remoter.run('yum list installed | grep scylla')
             logging.info("Before running rpm upgrade")
-            node.remoter.sudo('rpm -URvh --replacepkgs --replacefiles --nodeps --force /tmp/scylla/*.rpm',
-                              ignore_status=False, verbose=True)
+            node.remoter.run('sudo rpm -URvh --replacepkgs --replacefiles --nodeps --force /tmp/scylla/*.rpm',
+                             ignore_status=False, verbose=True)
             logging.info("After running rpm upgrade")
             node.remoter.run('yum list installed | grep scylla')
             _queue.put(node)
