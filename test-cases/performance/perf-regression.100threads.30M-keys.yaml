@@ -24,4 +24,4 @@ email_recipients: ['qa@scylladb.com']
 
 use_legacy_cluster_init: false
 
-update_db_packages: "s3://roy-rpms/4/"
+update_db_packages: "s3://roy-rpms/2/"
