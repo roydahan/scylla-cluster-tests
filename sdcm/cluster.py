@@ -3075,7 +3075,7 @@ class BaseScyllaCluster:  # pylint: disable=too-many-public-methods
             # node.remoter.run('yum list installed | grep scylla')
             logging.info("unzipping tar.gz rpms")
             node.remoter.run('tar -xvf /tmp/scylla/*.tar.gz -C /tmp/scylla/',
-                             ignore_status=False, verbose=True)
+                             ignore_status=True, verbose=True)
             logging.info("Running rpm upgrade")
             node.remoter.run('sudo rpm -URvh --replacepkgs --replacefiles --nodeps --force /tmp/scylla/*.rpm',
                              ignore_status=False, verbose=True)
