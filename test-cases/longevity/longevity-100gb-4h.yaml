@@ -12,7 +12,7 @@ n_monitor_nodes: 1
 
 instance_type_db: 'i3.4xlarge'
 
-nemesis_class_name: 'ChaosMonkey'
+nemesis_class_name: 'MemoryStressMonkey'
 nemesis_interval: 5
 nemesis_filter_seeds: false
 seeds_num: 3
