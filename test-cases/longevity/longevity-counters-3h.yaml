@@ -13,7 +13,7 @@ user_prefix: longevity-counters-3h
 
 space_node_threshold: 6442
 
-nemesis_class_name: 'ChaosMonkey'
+nemesis_class_name: 'MemoryStressMonkey'
 nemesis_interval: 5
 
 use_mgmt: true
