@@ -5,14 +5,12 @@ def lib = library identifier: 'sct@snapshot', retriever: legacySCM(scm)
 
 rollingUpgradePipeline(
     backend: 'gce',
-    base_versions: ['2020.1', '4.3', '2021.1'],
+    base_versions: ['2020.1'],
     linux_distro: 'centos',
     gce_image_db: 'https://www.googleapis.com/compute/v1/projects/centos-cloud/global/images/family/centos-7',
 
     test_name: 'upgrade_test.UpgradeTest.test_rolling_upgrade',
     test_config: 'test-cases/upgrades/rolling-upgrade.yaml',
-    workaround_kernel_bug_for_iotune: false,
-    internode_compression: 'all',
 
     timeout: [time: 360, unit: 'MINUTES']
 )
