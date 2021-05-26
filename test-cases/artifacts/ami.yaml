@@ -15,3 +15,4 @@ scylla_linux_distro: 'centos'
 test_duration: 60
 user_prefix: 'artifacts-ami'
 system_auth_rf: 1
+workaround_kernel_bug_for_iotune: true
