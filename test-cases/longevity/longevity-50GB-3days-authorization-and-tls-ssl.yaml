@@ -24,7 +24,7 @@ user_prefix: 'longevity-tls-50gb-3d'
 space_node_threshold: 644245094
 
 server_encrypt: true
-client_encrypt: true
+client_encrypt: false
 
 authenticator: 'PasswordAuthenticator'
 authenticator_user: cassandra
