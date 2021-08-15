@@ -3802,7 +3802,7 @@ class BaseScyllaCluster:  # pylint: disable=too-many-public-methods, too-many-in
                 self.log.info('Installed .deb packages before replacing with new .DEB files')
                 node.remoter.run('apt list --installed | grep scylla', verbose=True)
                 node.remoter.sudo('sh -c \'yes Y | dpkg --force-depends -i /tmp/scylla/scylla*\'',
-                                  ignore_status=False, verbose=True)
+                                  ignore_status=True, verbose=True)
                 self.log.info('Installed .deb packages after replacing with new .DEB files')
                 node.remoter.run('apt list --installed | grep scylla', verbose=True)
             _queue.put(node)
