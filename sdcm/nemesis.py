@@ -1096,7 +1096,10 @@ class Nemesis:  # pylint: disable=too-many-instance-attributes,too-many-public-m
             self.metrics_srv.event_stop(disrupt_method_name)
 
     def get_all_disrupt_methods(self):
-        all_disruptions = [attr[1] for attr in inspect.getmembers(self)
+        if self.cluster.params.get('nemesis_filter'):
+            self.get_list_of_methods_by_flags()
+        else:
+            all_disruptions = [attr[1] for attr in inspect.getmembers(self)
                            if attr[0].startswith('disrupt_') and callable(attr[1])]
         self.disruptions_list.extend(all_disruptions)
 
