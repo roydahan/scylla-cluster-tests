@@ -12,7 +12,9 @@ n_monitor_nodes: 1
 
 instance_type_db: 'i3.4xlarge'
 
-nemesis_class_name: 'LimitedChaosMonkey'
+nemesis_class_name: 'SisyphusMonkey'
+nemesis_filter: ['limited']
+nemesis_multiply_factor: 10
 nemesis_interval: 30
 nemesis_during_prepare: false
 
