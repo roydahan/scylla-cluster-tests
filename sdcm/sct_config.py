@@ -1205,6 +1205,20 @@ class SCTConfiguration(dict):
         dict(name="data_volume_disk_iops", env="SCT_DATA_VOLUME_DISK_IOPS",
              type=int,
              help="Number of iops for ebs type io2|io3|gp3"),
+
+        dict(name="nemesis_filter", env="SCT_NEMESIS_FILTER",
+             type=str_or_list,
+             help="""nemesis_filter is an INCLUDE filter. 
+             it filters IN all the nemesis that has one of the flags in the list set to true.
+             (IOW filters out all nemesis that doesn't have this flag set to true)
+             If a flag doesn't exist, all nemesis will be included.
+             When more than one flag is in the list, the list is the intersection of all the nemesis that has each flag 
+             (IOW it "AND" operator). """),
+
+        dict(name="nemesis_multiply_factor", env="SCT_NEMESIS_MULTIPLY_FACTOR",
+             type=int,
+             help="Multiply the list of nemesis to execute by the specified factor"),
+
     ]
 
     required_params = ['cluster_backend', 'test_duration', 'n_db_nodes', 'n_loaders', 'use_preinstalled_scylla',
