@@ -1149,13 +1149,13 @@ class Nemesis:  # pylint: disable=too-many-instance-attributes,too-many-public-m
         else:
             disruptions = [attr[1] for attr in inspect.getmembers(self)
                            if attr[0].startswith('disrupt_') and callable(attr[1])]
-        self.disruptions_list.extend(disruptions)
 
         nemesis_multiply_factor = self.cluster.params.get('nemesis_multiply_factor')
         disruptions = disruptions * nemesis_multiply_factor
 
-        self.log.debug("This is the list of callable disruptions {}".format(disruptions))
-        return disruptions
+        self.disruptions_list.extend(disruptions)
+        self.log.debug("This is the list of callable disruptions {}".format(self.disruptions_list))
+        return self.disruptions_list
 
     def shuffle_list_of_disruptions(self):
         if self.cluster.params.get('nemesis_seed'):
