@@ -1151,7 +1151,8 @@ class Nemesis:  # pylint: disable=too-many-instance-attributes,too-many-public-m
                            if attr[0].startswith('disrupt_') and callable(attr[1])]
 
         nemesis_multiply_factor = self.cluster.params.get('nemesis_multiply_factor')
-        disruptions = disruptions * nemesis_multiply_factor
+        if nemesis_multiply_factor:
+            disruptions = disruptions * nemesis_multiply_factor
 
         self.disruptions_list.extend(disruptions)
         self.log.debug("This is the list of callable disruptions {}".format(self.disruptions_list))
