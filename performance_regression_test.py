@@ -413,6 +413,9 @@ class PerformanceRegressionTest(ClusterTester):  # pylint: disable=too-many-publ
         self.get_stress_results(queue=stress_queue, store_results=False)
         self.update_test_details()
 
+        # Wait till all compactions are finished
+        self.wait_no_compactions_running()
+
         # create new document in ES with doc_id = test_id + timestamp
         # allow to correctly save results for future compare
         self.create_test_stats(doc_id_with_timestamp=True)
@@ -444,6 +447,9 @@ class PerformanceRegressionTest(ClusterTester):  # pylint: disable=too-many-publ
                                               stats_aggregate_cmds=False)
         self.get_stress_results(queue=stress_queue, store_results=False)
         self.update_test_details()
+
+        # Wait till all compactions are finished
+        self.wait_no_compactions_running()
 
         # run a mixed workload
         # create new document in ES with doc_id = test_id + timestamp
