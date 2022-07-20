@@ -27,3 +27,5 @@ store_perf_results: true
 send_email: true
 email_recipients: ['qa@scylladb.com', 'rnd-internal@scylladb.com']
 backtrace_decoding: false
+
+update_db_packages: "s3://downloads.scylladb.com/unstable/scylla/branch-5.0/deb/unified/2022-03-16T14:40:21Z/scylladb-5.0/pool/main/s/scylla-server/"
