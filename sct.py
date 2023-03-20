@@ -178,7 +178,7 @@ class SctLoader(unittest.TestLoader):
               help="Install paths for extra python packages to install, scylla-cluster-plugins for example")
 def cli():
     LOGGER.info("install-bash-completion current path: %s", os.getcwd())
-    docker_hub_login(remoter=LOCALRUNNER)
+    #docker_hub_login(remoter=LOCALRUNNER)
 
 
 @cli.command('provision-resources', help="Provision resources for the test")
