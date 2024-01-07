@@ -32,8 +32,8 @@ n_db_nodes: 3
 n_monitor_nodes: 1
 
 # Loaders
-gce_instance_type_loader: 'c2-standard-30'
-n_loaders: 15
+gce_instance_type_loader: 'h3-standard-88'
+n_loaders: 10
 stress_multiplier_r: 15
 stress_multiplier_w: 4
 stress_multiplier_m: 2
