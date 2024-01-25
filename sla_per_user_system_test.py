@@ -395,12 +395,12 @@ class SlaPerUserTest(LongevityTest):
         read_cmds = [self.define_read_cassandra_stress_command(role=read_users[0]["role"],
                                                                load_type=load,
                                                                c_s_workload_type=self.WORKLOAD_THROUGHPUT,
-                                                               threads=1500,
+                                                               threads=2000,
                                                                stress_duration_min=stress_duration),
                      self.define_read_cassandra_stress_command(role=read_users[1]["role"],
                                                                load_type=load,
                                                                c_s_workload_type=self.WORKLOAD_THROUGHPUT,
-                                                               threads=1500,
+                                                               threads=2000,
                                                                stress_duration_min=stress_duration)
                      ]
 
