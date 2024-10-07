@@ -1930,6 +1930,7 @@ class Nemesis:  # pylint: disable=too-many-instance-attributes,too-many-public-m
             disruptions = disruptions * nemesis_multiply_factor
 
         self.disruptions_list.extend(disruptions)
+        self.log.info("List of disruptions to execute: %s", self.disruptions_list)
         return self.disruptions_list
 
     @property
@@ -2226,7 +2227,7 @@ class Nemesis:  # pylint: disable=too-many-instance-attributes,too-many-public-m
                     del added_columns_info['column_names'][column_name]
         if add:
             cmd = f"ALTER TABLE {self._add_drop_column_target_table[1]} " \
-                  f"ADD ( {', '.join(['%s %s' % (col[0], col[1]) for col in add])} );"
+                f"ADD ( {', '.join(['%s %s' % (col[0], col[1]) for col in add])} );"
             if self._add_drop_column_run_cql_query(cmd, self._add_drop_column_target_table[0]):
                 for column_name, column_type in add:
                     added_columns_info['column_names'][column_name] = column_type
@@ -3737,11 +3738,11 @@ class Nemesis:  # pylint: disable=too-many-instance-attributes,too-many-public-m
             if match_type == 'random':
                 probability = random.choice(['0.0001', '0.001', '0.01', '0.1', '0.3', '0.6', '0.8', '0.9'])
                 return f'randomly chosen packet with {probability} probability', \
-                       f'-m statistic --mode {mode} --probability {probability}'
+                    f'-m statistic --mode {mode} --probability {probability}'
             elif match_type == 'nth':
                 every = random.choice(['2', '4', '8', '16', '32', '64', '128'])
                 return f'every {every} packet', \
-                       f'-m statistic --mode {mode} --every {every} --packet 0'
+                    f'-m statistic --mode {mode} --every {every} --packet 0'
         elif match_type == 'limit':
             period = random.choice(['second', 'minute'])
             pkts_per_period = random.choice({
@@ -3749,11 +3750,11 @@ class Nemesis:  # pylint: disable=too-many-instance-attributes,too-many-public-m
                 'minute': [2, 10, 40, 80]
             }.get(period))
             return f'string of {pkts_per_period} very first packets every {period}', \
-                   f'-m limit --limit {pkts_per_period}/{period}'
+                f'-m limit --limit {pkts_per_period}/{period}'
         elif match_type == 'connbytes':
             bytes_from = random.choice(['100', '200', '400', '800', '1600', '3200', '6400', '12800', '1280000'])
             return f'every packet from connection that total byte counter exceeds {bytes_from}', \
-                   f'-m connbytes --connbytes-mode bytes --connbytes-dir both --connbytes {bytes_from}'
+                f'-m connbytes --connbytes-mode bytes --connbytes-dir both --connbytes {bytes_from}'
         return 'every packet', ''
 
     @staticmethod
@@ -3773,7 +3774,7 @@ class Nemesis:  # pylint: disable=too-many-instance-attributes,too-many-public-m
                 'icmp-admin-prohibited'
             ])
             return f'rejected with {reject_with}', \
-                   f'{target_type} --reject-with {reject_with}'
+                f'{target_type} --reject-with {reject_with}'
         return 'dropped', f'{target_type}'
 
     def _run_commands_wait_and_cleanup(  # pylint: disable=too-many-arguments
@@ -4591,17 +4592,17 @@ class Nemesis:  # pylint: disable=too-many-instance-attributes,too-many-public-m
     def _write_read_data_to_multi_dc_keyspace(self, datacenters: List[str]) -> None:
         InfoEvent(message='Writing and reading data with new dc').publish()
         write_cmd = f"cassandra-stress write no-warmup cl=ALL n=10000 -schema 'keyspace=keyspace_new_dc " \
-                    f"replication(strategy=NetworkTopologyStrategy,{datacenters[0]}=3,{datacenters[1]}=1) " \
-                    f"compression=LZ4Compressor compaction(strategy=SizeTieredCompactionStrategy)' " \
-                    f"-mode cql3 native compression=lz4 -rate threads=5 -pop seq=1..10000 -log interval=5"
+            f"replication(strategy=NetworkTopologyStrategy,{datacenters[0]}=3,{datacenters[1]}=1) " \
+            f"compression=LZ4Compressor compaction(strategy=SizeTieredCompactionStrategy)' " \
+            f"-mode cql3 native compression=lz4 -rate threads=5 -pop seq=1..10000 -log interval=5"
         write_thread = self.tester.run_stress_thread(stress_cmd=write_cmd, round_robin=True, stop_test_on_failure=False)
         self.tester.verify_stress_thread(cs_thread_pool=write_thread)
         self._verify_multi_dc_keyspace_data(consistency_level="ALL")
 
     def _verify_multi_dc_keyspace_data(self, consistency_level: str = "ALL"):
         read_cmd = f"cassandra-stress read no-warmup cl={consistency_level} n=10000 -schema 'keyspace=keyspace_new_dc " \
-                   f"compression=LZ4Compressor' -mode cql3 native compression=lz4 -rate threads=5 " \
-                   f"-pop seq=1..10000 -log interval=5"
+            f"compression=LZ4Compressor' -mode cql3 native compression=lz4 -rate threads=5 " \
+            f"-pop seq=1..10000 -log interval=5"
         read_thread = self.tester.run_stress_thread(stress_cmd=read_cmd, round_robin=True, stop_test_on_failure=False)
         self.tester.verify_stress_thread(cs_thread_pool=read_thread)
 
@@ -5006,16 +5007,16 @@ class Nemesis:  # pylint: disable=too-many-instance-attributes,too-many-public-m
             audit_start = datetime.datetime.now() - datetime.timedelta(seconds=5)
             InfoEvent(message='Writing/Reading data from audited keyspace').publish()
             write_cmd = f"cassandra-stress write no-warmup cl=ONE n=1000 -schema" \
-                        f" 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)" \
-                        f" keyspace={audit_keyspace}' -mode cql3 native -rate 'threads=1 throttle=1000/s'" \
-                        f" -pop seq=1..1000 -col 'n=FIXED(1) size=FIXED(128)' -log interval=5"
+                f" 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)" \
+                f" keyspace={audit_keyspace}' -mode cql3 native -rate 'threads=1 throttle=1000/s'" \
+                f" -pop seq=1..1000 -col 'n=FIXED(1) size=FIXED(128)' -log interval=5"
             write_thread = self.tester.run_stress_thread(
                 stress_cmd=write_cmd, round_robin=True, stop_test_on_failure=False)
             self.tester.verify_stress_thread(cs_thread_pool=write_thread)
             read_cmd = f"cassandra-stress read no-warmup cl=ONE n=1000 " \
-                       f" -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)" \
-                       f" keyspace={audit_keyspace}' -mode cql3 native -rate 'threads=1 throttle=1000/s'" \
-                       f" -pop seq=1..1000 -col 'n=FIXED(1) size=FIXED(128)' -log interval=5"
+                f" -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)" \
+                f" keyspace={audit_keyspace}' -mode cql3 native -rate 'threads=1 throttle=1000/s'" \
+                f" -pop seq=1..1000 -col 'n=FIXED(1) size=FIXED(128)' -log interval=5"
             read_thread = self.tester.run_stress_thread(
                 stress_cmd=read_cmd, round_robin=True, stop_test_on_failure=False)
             self.tester.verify_stress_thread(cs_thread_pool=read_thread)
