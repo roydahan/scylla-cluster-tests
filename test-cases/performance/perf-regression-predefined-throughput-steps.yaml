@@ -36,8 +36,8 @@ stress_cmd_m: [
 
 round_robin: true
 
-n_db_nodes: 5
-n_loaders: 4
+n_db_nodes: 1
+n_loaders: 0
 n_monitor_nodes: 1
 
 instance_type_db: 'i4i.4xlarge'
@@ -57,7 +57,7 @@ print_kernel_callstack: true
 
 store_perf_results: true
 use_mgmt: false
-email_recipients: ['scylla-perf-results@scylladb.com']
+email_recipients: ['roy@scylladb.com']
 
 custom_es_index: 'performancestatsv2'
 use_hdr_cs_histogram: true
