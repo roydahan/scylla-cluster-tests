@@ -48,5 +48,5 @@ nemesis_during_prepare: false
 user_prefix: 'longevity-large-partitions-1h'
 
 run_fullscan:
-  - '{"mode": "table", "ks_cf": "scylla_bench.test", "interval": 10}'
-  - '{"mode": "partition", "ks_cf": "scylla_bench.test", "interval": 300, "pk_name":"pk", "rows_count": 5000, "validate_data": true, "include_data_column": true}'
+  - '{"mode": "table", "ks_cf": "scylla_bench.test", "interval": 20}'
+  - '{"mode": "partition", "ks_cf": "scylla_bench.test", "interval": 300, "pk_name":"pk", "rows_count": 5555, "validate_data": true, "include_data_column": true}'
