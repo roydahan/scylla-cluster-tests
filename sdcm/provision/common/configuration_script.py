@@ -97,7 +97,7 @@ class ConfigurationScriptBuilder(AttrBuilder, metaclass=abc.ABCMeta):
             script += install_syslogng_service()
             script += configure_syslogng_target_script(hostname=self.hostname)
             script += restart_syslogng_service()
-            script += install_syslogng_exporter()
+            # script += install_syslogng_exporter()
 
         if self.configure_sshd:
             script += configure_sshd_script()
