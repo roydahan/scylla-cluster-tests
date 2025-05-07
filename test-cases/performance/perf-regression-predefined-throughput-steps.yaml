@@ -41,9 +41,11 @@ n_loaders: 4
 n_monitor_nodes: 1
 
 instance_type_db: 'i7i.4xlarge'
-ami_db_scylla_user: 'ec2-user'
+force_run_iotune: true # needed for i7i
+
 
 # To run with Amazon Linux 2023
+#ami_db_scylla_user: 'ec2-user'
 #ami_id_db_scylla: 'resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64'
 #user_credentials_path: '~/.ssh/scylla_test_id_ed25519'
 #logs_transport: 'ssh'
