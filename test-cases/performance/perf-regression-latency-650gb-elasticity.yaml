@@ -15,7 +15,7 @@ n_monitor_nodes: 1
 
 instance_type_loader: 'c7i.2xlarge'
 instance_type_monitor: 't3.large'
-instance_type_db: 'i7i.2xlarge'
+instance_type_db: 'i7i.4xlarge'
 
 nemesis_class_name: 'GrowShrinkClusterNemesis'
 nemesis_interval: 30
@@ -37,3 +37,6 @@ use_hdrhistogram: true
 email_subject_postfix: 'elasticity test'
 nemesis_double_load_during_grow_shrink_duration: 30
 parallel_node_operations: true
+
+use_preinstalled_scylla: true
+force_run_iotune: true
