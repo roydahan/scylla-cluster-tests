@@ -20,20 +20,20 @@ stress_cmd_w:  [
 #  "cassandra-stress read  cl=QUORUM duration=30m -mode connectionsPerHost=8 cql3 native -rate 'threads=$threads $throttle' -col 'size=FIXED(1024) n=FIXED(1)' -pop 'dist=gauss(1..3250000,325000002,650000004)' "
 #]
 
-# Trying to split ranges into 2: One range reads from the cahce (1..100M) and the other reads from disk (100M..200M)
+# Read the entire data set to ensure disk only reads
 stress_cmd_r: [
-  "cassandra-stress read  cl=QUORUM duration=30m -mode connectionsPerHost=8 cql3 native -rate 'threads=$threads $throttle' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=1..50000000",
-  "cassandra-stress read  cl=QUORUM duration=30m -mode connectionsPerHost=8 cql3 native -rate 'threads=$threads $throttle' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=50000001..100000000",
-  "cassandra-stress read  cl=QUORUM duration=30m -mode connectionsPerHost=8 cql3 native -rate 'threads=$threads $throttle' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=100000001..150000000",
-  "cassandra-stress read  cl=QUORUM duration=30m -mode connectionsPerHost=8 cql3 native -rate 'threads=$threads $throttle' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=150000001..200000000"
+  "cassandra-stress read  cl=QUORUM duration=30m -mode connectionsPerHost=8 cql3 native -rate 'threads=$threads $throttle' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=1..162500001",
+  "cassandra-stress read  cl=QUORUM duration=30m -mode connectionsPerHost=8 cql3 native -rate 'threads=$threads $throttle' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=162500002..325000002",
+  "cassandra-stress read  cl=QUORUM duration=30m -mode connectionsPerHost=8 cql3 native -rate 'threads=$threads $throttle' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=325000003..487500003",
+  "cassandra-stress read  cl=QUORUM duration=30m -mode connectionsPerHost=8 cql3 native -rate 'threads=$threads $throttle' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=487500004..650000004"
 ]
 
-stress_cmd_cache_warmup: [
-  "cassandra-stress read  cl=ALL n=25000000 -mode connectionsPerHost=8 cql3 native -rate 'threads=$threads' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=1..25000000",
-  "cassandra-stress read  cl=ALL n=25000000 -mode connectionsPerHost=8 cql3 native -rate 'threads=$threads' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=25000001..50000000",
-  "cassandra-stress read  cl=ALL n=25000000 -mode connectionsPerHost=8 cql3 native -rate 'threads=$threads' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=50000001..75000000",
-  "cassandra-stress read  cl=ALL n=25000000 -mode connectionsPerHost=8 cql3 native -rate 'threads=$threads' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=75000001..100000000"
-]
+#stress_cmd_cache_warmup: [
+#  "cassandra-stress read  cl=ALL n=25000000 -mode connectionsPerHost=8 cql3 native -rate 'threads=$threads' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=1..25000000",
+#  "cassandra-stress read  cl=ALL n=25000000 -mode connectionsPerHost=8 cql3 native -rate 'threads=$threads' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=25000001..50000000",
+#  "cassandra-stress read  cl=ALL n=25000000 -mode connectionsPerHost=8 cql3 native -rate 'threads=$threads' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=50000001..75000000",
+#  "cassandra-stress read  cl=ALL n=25000000 -mode connectionsPerHost=8 cql3 native -rate 'threads=$threads' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=75000001..100000000"
+#]
 
 stress_cmd_m: [
   "cassandra-stress mixed  cl=QUORUM duration=30m -mode connectionsPerHost=8 cql3 native -rate 'threads=$threads $throttle' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=1..5000000",
