@@ -76,3 +76,7 @@ use_placement_group: true
 use_prepared_loaders: false
 stress_image:
   cassandra-stress: 'scylladb/cassandra-stress:3.18.1'
+
+scylla_d_overrides_files: [
+  'data_dir/io_properties.yaml'
+]
