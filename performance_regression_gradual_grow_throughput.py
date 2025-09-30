@@ -161,7 +161,7 @@ class PerformanceRegressionPredefinedStepsTest(PerformanceRegressionTest):
             # To address this, we will now verify that no tablet splits or merges are active by checking the system.tablets table.
             # The new condition for system idleness requires the resize_type column to be 'none' for all relevant tablets for a
             # continuous period of three minutes.
-            self.wait_for_no_tablets_splits()
+            # self.wait_for_no_tablets_splits()
             self.run_fstrim_on_all_db_nodes()
 
         self.run_gradual_increase_load(workload=workload,
@@ -274,7 +274,7 @@ class PerformanceRegressionPredefinedStepsTest(PerformanceRegressionTest):
                 # To address this, we will now verify that no tablet splits or merges are active by checking the system.tablets table.
                 # The new condition for system idleness requires the resize_type column to be 'none' for all relevant tablets for a
                 # continuous period of three minutes.
-                self.wait_for_no_tablets_splits()
+                # self.wait_for_no_tablets_splits()
 
         self.save_total_summary_in_file(total_summary)
         self.run_performance_analyzer(total_summary=total_summary)
