@@ -19,6 +19,11 @@ n_loaders: 2
 instance_type_db: 'i7i.large'
 instance_type_loader: 'c6i.xlarge'
 instance_provision_fallback_on_demand: false
+# Scale tests provision very large clusters (100+ nodes); relocating the whole cluster to a
+# fallback region can take far longer than the fixed Jenkins "Provision Resources" stage timeout,
+# leaving in-flight Spot Fleet Requests uncancelled if the stage is killed mid-relocation
+# (see SCT-779). AZ-level fallback within the configured region is unaffected.
+fallback_to_next_region: false
 
 # GCP
 gce_instance_type_db: 'n2-highmem-2'

@@ -18,6 +18,7 @@ import pytest
 from sdcm.sct_config import SCTConfiguration
 from sdcm.utils import resources_cleanup
 from sdcm.utils.resources_cleanup import (
+    cancel_leaked_spot_fleet_requests,
     clean_cloud_resources,
     clean_clusters_gke,
     clean_elastic_ips_aws,
@@ -339,6 +340,7 @@ class TestCleanCloudResources:
     integration = False  # set it to True if you want to run test with actual cloud operations.
     functions_to_patch = (
         "sdcm.utils.resources_cleanup.clean_emr_clusters",
+        "sdcm.utils.resources_cleanup.cancel_leaked_spot_fleet_requests",
         "sdcm.utils.resources_cleanup.clean_instances_aws",
         "sdcm.utils.resources_cleanup.clean_elastic_ips_aws",
         "sdcm.utils.resources_cleanup.clean_clusters_gke",
@@ -410,3 +412,90 @@ class TestCleanCloudResources:
         assert res  # the run completed and did not propagate the exception
         # clean_elastic_ips_aws runs right after the failing dedicated-hosts step
         resources_cleanup.clean_elastic_ips_aws.assert_called()
+
+
+class TestCancelLeakedSpotFleetRequests:
+    """SCT-779: a Spot Fleet Request killed mid-poll (e.g. by a Jenkins stage timeout) is never
+    cancelled by the in-process code path and can't be discovered by tag, so it must be tracked
+    via the TestConfig handoff file and cancelled explicitly during clean-resources."""
+
+    def test_no_test_id_is_noop(self):
+        with patch("boto3.client") as ec2_client:
+            cancel_leaked_spot_fleet_requests(None)
+        ec2_client.assert_not_called()
+
+    def test_no_registered_requests_is_noop(self):
+        with patch("sdcm.test_config.TestConfig.read_spot_fleet_requests", return_value=[]):
+            with patch("boto3.client") as ec2_client:
+                cancel_leaked_spot_fleet_requests("1111")
+        ec2_client.assert_not_called()
+
+    def test_active_request_is_cancelled_and_cleared(self):
+        entries = [{"request_id": "sfr-leaked", "region_name": "eu-west-3"}]
+        with patch("sdcm.test_config.TestConfig.read_spot_fleet_requests", return_value=entries):
+            with patch("sdcm.test_config.TestConfig.clear_spot_fleet_request") as clear_request:
+                with patch("boto3.client") as ec2_client_factory:
+                    ec2_client = ec2_client_factory.return_value
+                    ec2_client.describe_spot_fleet_requests.return_value = {
+                        "SpotFleetRequestConfigs": [{"SpotFleetRequestState": "active"}]
+                    }
+                    with patch("time.sleep") as sleep_mock:
+                        cancel_leaked_spot_fleet_requests("1111")
+
+        ec2_client_factory.assert_called_once_with("ec2", region_name="eu-west-3")
+        ec2_client.describe_spot_fleet_requests.assert_called_once_with(SpotFleetRequestIds=["sfr-leaked"])
+        ec2_client.cancel_spot_fleet_requests.assert_called_once_with(
+            SpotFleetRequestIds=["sfr-leaked"], TerminateInstances=True
+        )
+        clear_request.assert_called_once_with("1111", "sfr-leaked")
+        sleep_mock.assert_called_once()
+
+    def test_already_cancelled_request_is_cleared_without_api_call(self):
+        entries = [{"request_id": "sfr-old", "region_name": "eu-west-1"}]
+        with patch("sdcm.test_config.TestConfig.read_spot_fleet_requests", return_value=entries):
+            with patch("sdcm.test_config.TestConfig.clear_spot_fleet_request") as clear_request:
+                with patch("boto3.client") as ec2_client_factory:
+                    ec2_client = ec2_client_factory.return_value
+                    ec2_client.describe_spot_fleet_requests.return_value = {
+                        "SpotFleetRequestConfigs": [{"SpotFleetRequestState": "cancelled"}]
+                    }
+                    cancel_leaked_spot_fleet_requests("1111")
+
+        ec2_client.cancel_spot_fleet_requests.assert_not_called()
+        clear_request.assert_called_once_with("1111", "sfr-old")
+
+    def test_dry_run_does_not_cancel(self):
+        entries = [{"request_id": "sfr-leaked", "region_name": "eu-west-3"}]
+        with patch("sdcm.test_config.TestConfig.read_spot_fleet_requests", return_value=entries):
+            with patch("sdcm.test_config.TestConfig.clear_spot_fleet_request") as clear_request:
+                with patch("boto3.client") as ec2_client_factory:
+                    ec2_client = ec2_client_factory.return_value
+                    ec2_client.describe_spot_fleet_requests.return_value = {
+                        "SpotFleetRequestConfigs": [{"SpotFleetRequestState": "active"}]
+                    }
+                    with patch("time.sleep"):
+                        cancel_leaked_spot_fleet_requests("1111", dry_run=True)
+
+        ec2_client.cancel_spot_fleet_requests.assert_not_called()
+        clear_request.assert_called_once_with("1111", "sfr-leaked")
+
+    def test_client_error_on_one_request_does_not_abort_others(self):
+        entries = [
+            {"request_id": "sfr-broken", "region_name": "me-south-1"},
+            {"request_id": "sfr-ok", "region_name": "eu-west-1"},
+        ]
+        with patch("sdcm.test_config.TestConfig.read_spot_fleet_requests", return_value=entries):
+            with patch("sdcm.test_config.TestConfig.clear_spot_fleet_request") as clear_request:
+                with patch("boto3.client") as ec2_client_factory:
+                    broken_client = MagicMock()
+                    broken_client.describe_spot_fleet_requests.side_effect = resources_cleanup.ClientError(
+                        {"Error": {"Code": "UnauthorizedOperation", "Message": "denied"}}, "DescribeSpotFleetRequests"
+                    )
+                    ok_client = MagicMock()
+                    ok_client.describe_spot_fleet_requests.return_value = {
+                        "SpotFleetRequestConfigs": [{"SpotFleetRequestState": "cancelled"}]
+                    }
+                    ec2_client_factory.side_effect = [broken_client, ok_client]
+                    cancel_leaked_spot_fleet_requests("1111")
+
+        clear_request.assert_called_once_with("1111", "sfr-ok")

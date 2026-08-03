@@ -620,6 +620,18 @@ def test_36_update_config_based_on_version():
     conf.update_config_based_on_version()
 
 
+def test_36a_scale_tests_disable_region_fallback(monkeypatch):
+    # SCT-779: relocating a very large scale-test cluster across regions can exceed the fixed
+    # Jenkins "Provision Resources" stage timeout, leaving in-flight Spot Fleet Requests
+    # uncancelled. Scale tests must not attempt cross-region relocation.
+    monkeypatch.setenv("SCT_CLUSTER_BACKEND", "aws")
+    monkeypatch.setenv("SCT_AMI_ID_DB_SCYLLA", "ami-dummy")
+    monkeypatch.setenv("SCT_CONFIG_FILES", "test-cases/scale/scale-cluster.yaml")
+    monkeypatch.setenv("SCT_USE_MGMT", "false")
+    conf = sct_config.SCTConfiguration()
+    assert conf.get("fallback_to_next_region") is False
+
+
 def test_37_validates_single_thread_count_for_all_throttle_steps(monkeypatch):
     monkeypatch.setenv("SCT_PERF_GRADUAL_THREADS", '{"read": 620, "write": [630], "mixed": [500]}')
     monkeypatch.setenv(
@@ -917,6 +929,57 @@ def test_read_resolved_placement_returns_none_on_test_id_mismatch(placement_logd
     with open(path, "w", encoding="utf-8") as handle:
         yaml.safe_dump({"test_id": "some-other-id", "region_name": "eu-west-1", "availability_zone": "b"}, handle)
     assert TestConfig.read_resolved_placement("tid-2") is None
+
+
+def test_write_then_read_spot_fleet_requests_round_trips(placement_logdir):  # noqa: ARG001
+    # SCT-779: multiple requests can be registered across AZ/region retries for the same test.
+    TestConfig.write_spot_fleet_request("tid-sfr-1", region_name="eu-west-1", request_id="sfr-aaa")
+    TestConfig.write_spot_fleet_request("tid-sfr-1", region_name="eu-west-2", request_id="sfr-bbb")
+    assert TestConfig.read_spot_fleet_requests("tid-sfr-1") == [
+        {"request_id": "sfr-aaa", "region_name": "eu-west-1"},
+        {"request_id": "sfr-bbb", "region_name": "eu-west-2"},
+    ]
+
+
+def test_read_spot_fleet_requests_returns_empty_when_missing(placement_logdir):  # noqa: ARG001
+    assert TestConfig.read_spot_fleet_requests("tid-sfr-missing") == []
+
+
+def test_read_spot_fleet_requests_returns_empty_on_test_id_mismatch(placement_logdir):  # noqa: ARG001
+    path = TestConfig.spot_fleet_requests_file_path("tid-sfr-2")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(
+            {"test_id": "some-other-id", "requests": [{"request_id": "sfr-x", "region_name": "eu-west-1"}]}, handle
+        )
+    assert TestConfig.read_spot_fleet_requests("tid-sfr-2") == []
+
+
+def test_clear_spot_fleet_request_removes_only_matching_entry(placement_logdir):  # noqa: ARG001
+    TestConfig.write_spot_fleet_request("tid-sfr-3", region_name="eu-west-1", request_id="sfr-aaa")
+    TestConfig.write_spot_fleet_request("tid-sfr-3", region_name="eu-west-2", request_id="sfr-bbb")
+
+    TestConfig.clear_spot_fleet_request("tid-sfr-3", "sfr-aaa")
+
+    assert TestConfig.read_spot_fleet_requests("tid-sfr-3") == [{"request_id": "sfr-bbb", "region_name": "eu-west-2"}]
+
+
+def test_clear_spot_fleet_request_deletes_file_when_last_entry_removed(placement_logdir):  # noqa: ARG001
+    TestConfig.write_spot_fleet_request("tid-sfr-4", region_name="eu-west-1", request_id="sfr-aaa")
+
+    TestConfig.clear_spot_fleet_request("tid-sfr-4", "sfr-aaa")
+
+    assert TestConfig.read_spot_fleet_requests("tid-sfr-4") == []
+    assert not os.path.exists(TestConfig.spot_fleet_requests_file_path("tid-sfr-4"))
+
+
+def test_delete_spot_fleet_requests_is_idempotent(placement_logdir):  # noqa: ARG001
+    TestConfig.write_spot_fleet_request("tid-sfr-5", region_name="eu-west-1", request_id="sfr-aaa")
+
+    TestConfig.delete_spot_fleet_requests("tid-sfr-5")
+    TestConfig.delete_spot_fleet_requests("tid-sfr-5")  # must not raise on a second call
+
+    assert TestConfig.read_spot_fleet_requests("tid-sfr-5") == []
 
 
 @pytest.mark.parametrize(

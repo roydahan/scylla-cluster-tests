@@ -158,6 +158,11 @@ def clean_cloud_resources(tags_dict, config=None, dry_run=False):
         with cleanup_step("EMR clusters"):
             clean_emr_clusters(tags_dict, regions=aws_regions, dry_run=dry_run)
     if cluster_backend in ("aws", "k8s-eks", ""):
+        with cleanup_step("AWS leaked spot fleet requests"):
+            # Run before instance cleanup: a request that was never cancelled may still be
+            # asynchronously fulfilling in the background, so cancel it first and give AWS a
+            # moment to settle before scanning for instances to terminate.
+            cancel_leaked_spot_fleet_requests(tags_dict.get("TestId"), dry_run=dry_run)
         with cleanup_step("AWS instances"):
             clean_instances_aws(tags_dict, regions=aws_regions, dry_run=dry_run)
         with cleanup_step("AWS capacity reservations"):
@@ -400,6 +405,59 @@ def clean_orphan_block_volumes_oci(tags_dict: dict, dry_run: bool = False, regio
                 region=region,
                 logger=LOGGER,
             )
+
+
+def cancel_leaked_spot_fleet_requests(test_id: str, dry_run: bool = False) -> None:
+    """Cancel any Spot Fleet Requests for ``test_id`` that were never cleanly closed.
+
+    Spot Fleet Requests aren't taggable with ``TestId`` (only the instances they launch are), so
+    they can't be discovered by scanning AWS the way instances/EIPs/security-groups are. Instead,
+    ``sdcm.test_config.TestConfig`` persists request ids as they are created (see
+    ``write_spot_fleet_request``); this reads that handoff and cancels anything still open.
+
+    Without this, a request that survives an abrupt process kill (e.g. a Jenkins stage timeout)
+    keeps being fulfilled by AWS in the background even after the rest of clean-resources has
+    already run its instance-cleanup pass, leaking instances. See SCT-779.
+    """
+    from sdcm.test_config import TestConfig  # noqa: PLC0415  # avoid import cycle at module load
+
+    if not test_id:
+        return
+
+    entries = TestConfig.read_spot_fleet_requests(test_id)
+    if not entries:
+        return
+
+    any_active = False
+    for entry in entries:
+        request_id = entry.get("request_id")
+        region_name = entry.get("region_name")
+        if not request_id or not region_name:
+            continue
+        try:
+            client: EC2Client = boto3.client("ec2", region_name=region_name)
+            resp = client.describe_spot_fleet_requests(SpotFleetRequestIds=[request_id])
+            configs = resp.get("SpotFleetRequestConfigs") or []
+            state = configs[0]["SpotFleetRequestState"] if configs else "cancelled_or_unknown"
+            if state in ("cancelled", "cancelled_running", "cancelled_terminating", "cancelled_or_unknown"):
+                TestConfig.clear_spot_fleet_request(test_id, request_id)
+                continue
+
+            any_active = True
+            LOGGER.warning(
+                "Found leaked Spot Fleet Request %s in %s (state=%s) for test_id=%s", request_id, region_name, state,
+                test_id,
+            )
+            if not dry_run:
+                client.cancel_spot_fleet_requests(SpotFleetRequestIds=[request_id], TerminateInstances=True)
+            TestConfig.clear_spot_fleet_request(test_id, request_id)
+        except ClientError as exc:
+            LOGGER.warning("Failed to cancel leaked Spot Fleet Request %s in %s: %s", request_id, region_name, exc)
+
+    if any_active:
+        # Instances launched by a request that only just got cancelled may still be starting up;
+        # give AWS a moment before the instance-cleanup pass runs so they get picked up too.
+        time.sleep(30)
 
 
 def clean_instances_aws(tags_dict: dict, regions=None, dry_run=False):
