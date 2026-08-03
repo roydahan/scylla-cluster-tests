@@ -6,7 +6,7 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, TYPE_CHECKING
+from typing import Optional, Dict, List, TYPE_CHECKING
 from uuid import uuid4
 
 import yaml
@@ -61,6 +61,7 @@ class TestConfig(metaclass=Singleton):
     LDAP_USERS_ON_SCYLLA: bool = False
     DECODING_QUEUE = None
     RESOLVED_PLACEMENT_FILENAME = "resolved_placement.yaml"
+    SPOT_FLEET_REQUESTS_FILENAME = "spot_fleet_requests.yaml"
 
     _test_id = None
     _test_name = None
@@ -236,6 +237,89 @@ class TestConfig(metaclass=Singleton):
         except FileNotFoundError:
             return
         LOGGER.info("Deleted resolved placement handoff %s", file_path)
+
+    @classmethod
+    def spot_fleet_requests_file_path(cls, test_id: str) -> str:
+        """Return the file path used to hand off in-flight Spot Fleet Request IDs for a test id.
+
+        A Spot Fleet Request is not taggable with ``TestId`` (only the instances it launches are),
+        so if the process that created it dies before it can cancel the request itself (e.g. a
+        Jenkins stage timeout kills the process mid-poll), nothing else can discover that request
+        afterwards to cancel it. This file is the durable handoff that lets a later, separate
+        ``clean-resources`` invocation find and cancel any request that was never cleanly closed.
+        See SCT-779.
+        """
+        return os.path.join(cls.base_logdir(), f"{test_id}", cls.SPOT_FLEET_REQUESTS_FILENAME)
+
+    @classmethod
+    def write_spot_fleet_request(cls, test_id: str, region_name: str, request_id: str) -> str:
+        """Register an in-flight Spot Fleet Request so it can be cancelled later if leaked.
+
+        Appends to the existing list (a single test can create multiple fleet requests across
+        AZ/region retries).
+        """
+        file_path = cls.spot_fleet_requests_file_path(test_id)
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+        entries = cls.read_spot_fleet_requests(test_id)
+        entries.append({"request_id": request_id, "region_name": region_name})
+        with open(file_path, "w", encoding="utf-8") as handle:
+            yaml.safe_dump({"test_id": f"{test_id}", "requests": entries}, handle)
+        LOGGER.info("Registered spot fleet request handoff %s: %s/%s", file_path, region_name, request_id)
+
+        return file_path
+
+    @classmethod
+    def read_spot_fleet_requests(cls, test_id: str) -> List[Dict[str, str]]:
+        """Read the list of registered (not-yet-confirmed-cancelled) spot fleet requests."""
+        file_path = cls.spot_fleet_requests_file_path(test_id)
+        if not os.path.exists(file_path):
+            return []
+
+        try:
+            with open(file_path, encoding="utf-8") as handle:
+                data = yaml.safe_load(handle)
+        except (OSError, yaml.YAMLError) as exc:
+            LOGGER.warning("Failed to read spot fleet request handoff %s: %s", file_path, exc)
+            return []
+
+        if not isinstance(data, dict) or str(data.get("test_id")) != str(test_id):
+            LOGGER.warning(
+                "Ignoring spot fleet request handoff %s: test_id guard failed (got %s, expected %s)",
+                file_path,
+                data.get("test_id") if isinstance(data, dict) else data,
+                test_id,
+            )
+            return []
+        return data.get("requests") or []
+
+    @classmethod
+    def clear_spot_fleet_request(cls, test_id: str, request_id: str) -> None:
+        """Remove a single spot fleet request from the handoff file once it was cleanly cancelled."""
+        entries = cls.read_spot_fleet_requests(test_id)
+        remaining = [entry for entry in entries if entry.get("request_id") != request_id]
+        if len(remaining) == len(entries):
+            return
+
+        file_path = cls.spot_fleet_requests_file_path(test_id)
+        if not remaining:
+            try:
+                os.remove(file_path)
+            except FileNotFoundError:
+                pass
+            return
+        with open(file_path, "w", encoding="utf-8") as handle:
+            yaml.safe_dump({"test_id": f"{test_id}", "requests": remaining}, handle)
+
+    @classmethod
+    def delete_spot_fleet_requests(cls, test_id: str) -> None:
+        """Remove the spot fleet request handoff file entirely (e.g. after cleanup completes)."""
+        try:
+            file_path = cls.spot_fleet_requests_file_path(test_id)
+            os.remove(file_path)
+        except FileNotFoundError:
+            return
+        LOGGER.info("Deleted spot fleet request handoff %s", file_path)
 
     @classmethod
     def latency_results_file(cls):

@@ -165,6 +165,12 @@ class EC2ClientWrapper:
 
         request_id = resp["SpotFleetRequestId"]
         LOGGER.debug("Spot fleet request: %s", request_id)
+        if test_id := TestConfig.test_id():
+            # Spot Fleet Requests can't be tagged with TestId (only the instances they launch can),
+            # so register the request id in a durable handoff file. If this process gets killed
+            # before it reaches the cancel_spot_fleet_requests() calls below, a later, separate
+            # `clean-resources` run can still find and cancel it. See SCT-779.
+            TestConfig.write_spot_fleet_request(test_id, region_name=self.region_name, request_id=request_id)
         return request_id
 
     def _is_request_fulfilled(self, request_ids):
@@ -244,6 +250,8 @@ class EC2ClientWrapper:
             timeout += self._wait_interval
         if not status:
             self._client.cancel_spot_fleet_requests(SpotFleetRequestIds=[request_id], TerminateInstances=True)
+            if test_id := TestConfig.test_id():
+                TestConfig.clear_spot_fleet_request(test_id, request_id)
             return [], resp
         resp = self._client.describe_spot_fleet_instances(SpotFleetRequestId=request_id)
         return [inst["InstanceId"] for inst in resp["ActiveInstances"]], resp
@@ -408,6 +416,8 @@ class EC2ClientWrapper:
             self.add_tags(instance_id, {"Name": f"spot_fleet_{instance_id}_{ind}"})
 
         self._client.cancel_spot_fleet_requests(SpotFleetRequestIds=[request_id], TerminateInstances=False)
+        if test_id := TestConfig.test_id():
+            TestConfig.clear_spot_fleet_request(test_id, request_id)
 
         instances = [self.get_instance(instance_id) for instance_id in instance_ids]
         return instances

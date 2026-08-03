@@ -49,6 +49,7 @@ from sdcm.provision.aws.constants import (
     SPOT_CAPACITY_NOT_AVAILABLE_ERROR,
 )
 from sdcm.provision.common.provisioner import TagsType
+from sdcm.test_config import TestConfig
 from sdcm.utils.common import aws_tags_to_dict, list_instances_aws
 
 
@@ -314,7 +315,14 @@ def create_spot_fleet_instance_request(
     if valid_until:
         params["ValidUntil"] = valid_until
     resp = ec2_clients[region_name].request_spot_fleet(DryRun=False, SpotFleetRequestConfig=params)
-    return resp["SpotFleetRequestId"]
+    request_id = resp["SpotFleetRequestId"]
+    if test_id := TestConfig.test_id():
+        # Spot Fleet Requests can't be tagged with TestId (only the instances they launch can), so
+        # register the request id in a durable handoff file. If this process gets killed before it
+        # reaches the cancel_spot_fleet_requests() calls in this module, a later, separate
+        # `clean-resources` run can still find and cancel it. See SCT-779.
+        TestConfig.write_spot_fleet_request(test_id, region_name=region_name, request_id=request_id)
+    return request_id
 
 
 def create_spot_instance_request(

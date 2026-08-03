@@ -43,6 +43,7 @@ from sdcm.provision.aws.constants import (
     SPOT_CAPACITY_NOT_AVAILABLE_ERROR,
 )
 from sdcm.provision.common.provisioner import TagsType, ProvisionParameters, InstanceProvisionerBase
+from sdcm.test_config import TestConfig
 
 LOGGER = logging.getLogger(__name__)
 
@@ -225,6 +226,8 @@ class AWSInstanceProvisioner(InstanceProvisionerBase):
                 self._ec2_client(provision_parameters).cancel_spot_fleet_requests(
                     SpotFleetRequestIds=[request_id], TerminateInstances=True
                 )
+            if test_id := TestConfig.test_id():
+                TestConfig.clear_spot_fleet_request(test_id, request_id)
             return []
         LOGGER.info("Spot fleet instances: %s", instance_ids)
         for ind, instance_id in enumerate(instance_ids):
@@ -237,6 +240,8 @@ class AWSInstanceProvisioner(InstanceProvisionerBase):
         self._ec2_client(provision_parameters).cancel_spot_fleet_requests(
             SpotFleetRequestIds=[request_id], TerminateInstances=False
         )
+        if test_id := TestConfig.test_id():
+            TestConfig.clear_spot_fleet_request(test_id, request_id)
         return [
             find_instance_by_id(region_name=provision_parameters.region_name, instance_id=instance_id)
             for instance_id in instance_ids
@@ -294,6 +299,8 @@ class AWSInstanceProvisioner(InstanceProvisionerBase):
                 self._ec2_client(provision_parameters).cancel_spot_fleet_requests(
                     SpotFleetRequestIds=[request_id], TerminateInstances=True
                 )
+            if test_id := TestConfig.test_id():
+                TestConfig.clear_spot_fleet_request(test_id, request_id)
         return provisioned_instance_ids
 
     def _execute_spot_instance_request(
