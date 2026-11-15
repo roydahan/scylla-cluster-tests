@@ -4695,6 +4695,29 @@ class DeadNode:
             self.ip = f"{self.public_ip} | {self.private_ip}{f' | {self.ipv6_ip}' if self.ipv6_ip else ''}"
 
 
+# cap of the threads that do the teardown work of the nodes of a cluster at the same time, each thread opens its own
+# SSH connection, so a cluster of hundreds of nodes gets a fixed number of threads instead of one for each node
+TEARDOWN_NODES_MAX_WORKERS = 20
+
+
+def run_teardown_on_nodes(func: Callable[[BaseNode], Any], nodes: Iterable[BaseNode]) -> list[Any]:
+    """Run `func(node)` for every node, on up to TEARDOWN_NODES_MAX_WORKERS nodes at the same time.
+
+    Returns the results in the order of `nodes`. `func` is expected to handle the failure of its own node.
+    Every node is processed anyway: an exception that gets out of `func` is raised once all the nodes are done,
+    the one of the first such node in the order of `nodes`.
+    """
+    nodes = list(nodes)
+    if not nodes:
+        return []
+    with ThreadPoolExecutor(
+        max_workers=min(len(nodes), TEARDOWN_NODES_MAX_WORKERS), thread_name_prefix="NodesTeardown"
+    ) as executor:
+        futures = [executor.submit(func, node) for node in nodes]
+        # leaving the `with` on an exception still waits for all the submitted nodes
+        return [future.result() for future in futures]
+
+
 class BaseCluster:
     """Cluster of Node objects."""
 
@@ -5005,13 +5028,18 @@ class BaseCluster:
         return results
 
     def get_backtraces(self):
-        for node in self.nodes:
+        def get_node_coredumps(node) -> int:
             try:
                 node.get_backtraces()
-                if node.n_coredumps > 0:
-                    self.coredumps[node.name] = node.n_coredumps
+                return node.n_coredumps
             except Exception as ex:
                 self.log.exception(f"Unable to get coredump status from node {node}: {ex}")
+                return 0
+
+        nodes = list(self.nodes)
+        for node, n_coredumps in zip(nodes, run_teardown_on_nodes(get_node_coredumps, nodes), strict=True):
+            if n_coredumps > 0:
+                self.coredumps[node.name] = n_coredumps
 
     def node_setup(self, node, verbose=False, timeout=3600):
         raise NotImplementedError("Derived class must implement 'node_setup' method!")

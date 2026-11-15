@@ -58,6 +58,7 @@ from sdcm.cluster import (
     NoMonitorSet,
     TestConfig,
     UserRemoteCredentials,
+    run_teardown_on_nodes,
 )
 from sdcm.cluster_aws import CassandraAWSCluster, LoaderSetAWS, MonitorSetAWS, ScyllaAWSCluster, VectorStoreSetAWS
 from sdcm.cluster_azure import LoaderSetAzure, MonitorSetAzure, ScyllaAzureCluster
@@ -3974,12 +3975,15 @@ class ClusterTester(unittest.TestCase):
 
     @silence()
     def stop_resources_stop_tasks_threads(self, cluster):
-        # TODO: this should be run in parallel
-        for node in cluster.nodes:
+        nodes = list(cluster.nodes)
+        for node in nodes:
             node.stop_task_threads()
-        for node in cluster.nodes:
+
+        def wait_till_tasks_threads_are_stopped(node):
             with silence(parent=self, name=f"stop_resources_stop_tasks_threads(cluster={cluster!s})"):
                 node.wait_till_tasks_threads_are_stopped()
+
+        run_teardown_on_nodes(wait_till_tasks_threads_are_stopped, nodes)
 
     @silence()
     def get_backtraces(self, cluster):
