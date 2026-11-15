@@ -5961,27 +5961,31 @@ def _check_nodes_in_parallel(check: Callable[[BaseNode], Any], nodes: list[BaseN
     """Run `check(node)` for every node, on up to NODES_CHECK_MAX_WORKERS nodes at the same time.
 
     Raises the exception of the first failed node, in the order of `nodes`, the same one a serial loop
-    would raise. Once a check failed, no other check starts, and the running ones are waited for.
+    would raise. Once a check failed, no check of a later node starts, and the running ones are waited for.
     """
     if not nodes:
         return
-    failed = threading.Event()
+    first_failed = len(nodes)
+    first_failed_lock = threading.Lock()
 
-    def check_unless_failed(node: BaseNode) -> None:
+    def check_unless_earlier_failed(position: int, node: BaseNode) -> None:
+        nonlocal first_failed
         # `map` cancels the queued checks only after the caller sees the failure, and by then
-        # the workers that got free already took the next nodes
-        if failed.is_set():
+        # the workers that got free already took the next nodes.
+        # A node before the failed one is still checked: when it fails too, its error is the one to raise
+        if position > first_failed:
             return
         try:
             check(node)
         except BaseException:
-            failed.set()
+            with first_failed_lock:
+                first_failed = min(first_failed, position)
             raise
 
     with ThreadPoolExecutor(
         max_workers=min(len(nodes), NODES_CHECK_MAX_WORKERS), thread_name_prefix="NodesCheck"
     ) as executor:
-        for _ in executor.map(check_unless_failed, nodes):
+        for _ in executor.map(check_unless_earlier_failed, range(len(nodes)), nodes):
             pass
 
 

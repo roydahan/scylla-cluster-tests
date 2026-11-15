@@ -71,6 +71,32 @@ def _run_together(barrier, result):
     return side_effect
 
 
+class LaterNodesFirstExecutor:
+    """Stands for a pool whose threads get to the later nodes first: `map` runs the calls in the reversed order."""
+
+    def __init__(self, *_, **__):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def map(self, func, *iterables):
+        calls = list(zip(*iterables))
+        errors = {}
+        for position in reversed(range(len(calls))):
+            try:
+                func(*calls[position])
+            except AssertionError as exc:
+                errors[position] = exc
+        for position in range(len(calls)):
+            if position in errors:
+                raise errors[position]
+            yield None
+
+
 # --- wait_for_schema_agreement ---
 
 
@@ -127,6 +153,19 @@ def test_wait_for_schema_agreement_disagreeing_nodes_raise_assertion_error_of_fi
         DummyScyllaCluster(nodes).wait_for_schema_agreement()
 
     assert nodes[1].get_gossip_info.call_count == SCHEMA_AGREEMENT_RETRIES * CHECK_NODE_HEALTH_RETRIES
+
+
+def test_wait_for_schema_agreement_node_started_after_a_later_one_failed_is_still_checked(monkeypatch):
+    # node-3 fails before the check of node-1 starts, the error of node-1 is still the one to raise
+    monkeypatch.setattr("sdcm.cluster.ThreadPoolExecutor", LaterNodesFirstExecutor)
+    nodes = _make_nodes(5)
+    _set_schema_info(nodes, disagreeing=("node-1", "node-3"))
+
+    with pytest.raises(AssertionError, match=r"on the node node-1 "):
+        DummyScyllaCluster(nodes).wait_for_schema_agreement()
+
+    for node in (nodes[1], nodes[3]):
+        assert node.get_gossip_info.call_count == SCHEMA_AGREEMENT_RETRIES * CHECK_NODE_HEALTH_RETRIES
 
 
 def test_wait_for_schema_agreement_retries_until_nodes_agree():
@@ -231,7 +270,7 @@ def test_wait_all_nodes_un_unexpected_error_is_not_retried():
     assert nodes[1].run_nodetool.call_count == GET_NODETOOL_STATUS_RETRIES
 
 
-def test_wait_all_nodes_un_failed_check_stops_checks_of_other_nodes(monkeypatch):
+def test_wait_all_nodes_un_failed_check_stops_checks_of_later_nodes(monkeypatch):
     monkeypatch.setattr("sdcm.cluster.NODES_CHECK_MAX_WORKERS", 2)
     nodes = _make_nodes(6)
     # the two checks that run first fail at the same time, as when no node sees the cluster as ready
