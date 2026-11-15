@@ -235,14 +235,15 @@ class LongevityTest(ClusterTester, loader_utils.LoaderUtilsMixin):
                             if not skip_optional_stage("main_load"):
                                 self._run_all_stress_cmds(stress_queue, params)
 
-        # The stress threads above are already running; add the nodes under them, before any nemesis starts.
-        if grow_during_stress:
-            self._grow_cluster_under_stress(stress_queue, stress_round, keyspace_num)
-
         # Check if we shall wait for total_used_space or if nemesis wasn't started
         if not prepare_write_cmd or not self.params.get("nemesis_during_prepare"):
             self.db_cluster.wait_total_space_used_per_node(keyspace=None)
             self.db_cluster.start_nemesis()
+
+        # The stress threads and the nemesis are already running; add the nodes under them. This returns
+        # only when the last stress_cmd round ended, so a nemesis started after it would never run.
+        if grow_during_stress:
+            self._grow_cluster_under_stress(stress_queue, stress_round, keyspace_num)
 
         stress_read_cmd = self.params.get("stress_read_cmd")
         if stress_read_cmd and not skip_optional_stage("main_load"):

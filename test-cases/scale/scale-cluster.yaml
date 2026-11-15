@@ -1,10 +1,9 @@
 test_metadata:
   description: >-
     Cluster-growth scale test: a 15-node cluster gets a small sanity dataset (5M rows of 1KB), then a
-    cassandra-stress write load and a read load over that dataset start, and the cluster is grown
-    towards a target size in batches while they run, with fullscans throughout. SisyphusMonkey starts
-    once the cluster reaches its target size. Parameterised by the pipelines into the 15-25, 40-60,
-    180-200 and 450-500 node growth jobs.
+    cassandra-stress write load, a read load over that dataset and SisyphusMonkey start, and the
+    cluster is grown towards a target size in batches while they run, with fullscans throughout.
+    Parameterised by the pipelines into the 15-25, 40-60, 180-200 and 450-500 node growth jobs.
   test_type: scale
   tier: tier2
   duration_class: medium

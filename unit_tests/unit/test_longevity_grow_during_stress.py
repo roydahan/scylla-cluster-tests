@@ -76,7 +76,8 @@ def _params(**overrides):
 @pytest.mark.parametrize(
     "grow_during_stress, expected_order",
     [
-        pytest.param(True, ["prepare", "stress", "grow", "nemesis"], id="grow-under-stress"),
+        # the growth returns only once the last stress_cmd round ended: a nemesis started after it never runs
+        pytest.param(True, ["prepare", "stress", "nemesis", "grow"], id="grow-under-stress-and-nemesis"),
         pytest.param(False, ["prepare", "grow", "stress", "nemesis"], id="grow-before-stress"),
         pytest.param(None, ["prepare", "grow", "stress", "nemesis"], id="unset-keeps-old-order"),
     ],
