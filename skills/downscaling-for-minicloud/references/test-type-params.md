@@ -91,9 +91,8 @@ The trap case. This test **builds** its own cassandra-stress command.
 required: `add_nodes()` reconfigures Scylla monitoring after every node, and `setUp()` builds a
 Prometheus metrics object for the add-node timing.
 
-**Nemesis:** `nemesis_during_prepare: false` keeps it out of the prepare. It starts after the
-cluster reaches its target size, or, with `grow_cluster_during_stress`, right before the growth,
-so that it runs while the nodes are added.
+**Nemesis:** starts only after the cluster reaches its target size, so `nemesis_during_prepare:
+false`.
 
 **Worked example:** `configurations/minicloud/scale-cluster.yaml` — production 15 to 25 nodes
 (106 GiB of guests at the peak) shrunk to 3 to 4.

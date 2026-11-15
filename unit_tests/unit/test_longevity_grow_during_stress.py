@@ -26,6 +26,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from longevity_test import LongevityTest
+from sdcm.sct_events import Severity
 
 LongevityTest.__test__ = False
 
@@ -122,12 +123,12 @@ def test_grow_adds_batches_until_target(monkeypatch):
 # ------------------------------------------------------------------ re-running stress_cmd during growth
 
 
-def _stress_thread(done: bool = True) -> SimpleNamespace:
-    """A stand-in for a stress thread: only `results_futures` is read while the cluster grows."""
+def _stress_thread(done: bool = True, failed: bool = False) -> SimpleNamespace:
+    """A stand-in for a stress thread: `results_futures` is waited for, and `failed` is what its verification finds."""
     future = Future()
     if done:
         future.set_result(None)
-    return SimpleNamespace(results_futures=[future])
+    return SimpleNamespace(results_futures=[future], failed=failed)
 
 
 def _finish_after_growth(thread: SimpleNamespace, growth_returned: threading.Event) -> None:
@@ -159,10 +160,23 @@ class _RoundsLongevityTest(LongevityTest):
     def _grow_cluster_to_target_size(self):
         self._grow()
 
+    def verify_stress_thread(self, thread_pool, error_handler=None):
+        return not thread_pool.failed
+
 
 @pytest.fixture(autouse=True)
 def _no_events(monkeypatch):
     monkeypatch.setattr("longevity_test.InfoEvent", MagicMock())
+
+
+@pytest.fixture
+def error_event(monkeypatch):
+    """The event that reports a failed round; its `published` is set once the event is published."""
+    event = MagicMock()
+    event.published = threading.Event()
+    event.return_value.publish.side_effect = event.published.set
+    monkeypatch.setattr("longevity_test.TestFrameworkEvent", event)
+    return event
 
 
 def test_stress_is_run_again_until_the_growth_finishes():
@@ -203,6 +217,32 @@ def test_stress_is_not_run_again_once_the_growth_finished():
     test._grow_cluster_under_stress(list(first_round), first_round, keyspace_num=1)
 
     assert test.rounds == 0
+
+
+@pytest.mark.parametrize("healthy_rounds", [0, 2], ids=["first-round-fails", "third-round-fails"])
+def test_stress_is_not_run_again_after_a_round_failed(error_event, healthy_rounds):
+    growth_finished = threading.Event()
+
+    def grow():
+        assert error_event.published.wait(timeout=10)  # the growth outlasts the failed round
+        growth_finished.set()
+
+    def make_round(number):
+        if number <= healthy_rounds:
+            return _stress_thread(failed=number == healthy_rounds)
+        return _no_rerun_expected(number)
+
+    test = _RoundsLongevityTest(grow, make_round)
+    first_round = [_stress_thread(failed=healthy_rounds == 0)]
+    stress_queue = list(first_round)
+
+    test._grow_cluster_under_stress(stress_queue, first_round, keyspace_num=1)
+
+    assert test.rounds == healthy_rounds
+    assert len(stress_queue) == healthy_rounds + 1  # the failed round stays queued too, for the final verification
+    error_event.return_value.publish.assert_called_once_with()
+    assert error_event.call_args.kwargs["severity"] == Severity.ERROR
+    assert growth_finished.is_set()  # the growth is still awaited, without the load
 
 
 def test_growth_failure_is_raised_once_the_running_round_ends():

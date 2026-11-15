@@ -267,6 +267,9 @@ class LongevityTest(ClusterTester, loader_utils.LoaderUtilsMixin):
 
         `stress_round` holds the stress_cmd threads that are already running. Each new round is appended to
         `stress_queue` too, so every round is verified with the rest of the load.
+
+        A round that failed is not run again: it would fail again every few seconds for as long as the growth
+        lasts. The cluster then keeps growing without the stress_cmd load.
         """
         with concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="GrowCluster") as executor:
             growth = executor.submit(self._grow_cluster_to_target_size)
@@ -274,6 +277,15 @@ class LongevityTest(ClusterTester, loader_utils.LoaderUtilsMixin):
             while stress_round:
                 concurrent.futures.wait([future for thread in stress_round for future in thread.results_futures])
                 if growth.done():
+                    break
+                if not all([self.verify_stress_thread(thread) for thread in stress_round]):
+                    TestFrameworkEvent(
+                        source=self.__class__.__name__,
+                        source_method="_grow_cluster_under_stress",
+                        message="stress_cmd failed before the cluster reached its target size. It is not run "
+                        "again, and the cluster keeps growing without this load",
+                        severity=Severity.ERROR,
+                    ).publish()
                     break
                 InfoEvent(
                     message="stress_cmd finished before the cluster reached its target size, running it again"

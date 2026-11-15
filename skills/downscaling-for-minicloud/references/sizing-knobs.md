@@ -215,7 +215,7 @@ Shrinking the workload without shrinking `test_duration` wastes wall-clock; shri
 | `nemesis_selector` | **Add** `not disruptive`, never replace. Terminate/reboot/stop exercise emulated lifecycle paths that are not all implemented, but a base selector usually protects something the test asserts on. The field takes a boolean expression: `'not disruptive and not ModifyTableCompactionMonkey'` |
 | `nemesis_class_name` | `SisyphusMonkey` is the house choice; the selector does the filtering |
 | `nemesis_interval` | 1-5 minutes, so a short run sees more than one disruption |
-| `nemesis_during_prepare` | `false` for grow tests — the nemesis starts after the prepare: once the cluster reaches its target size, or right before the growth with `grow_cluster_during_stress` |
+| `nemesis_during_prepare` | `false` for grow tests — the nemesis starts after the cluster reaches its target size |
 
 ---
 
