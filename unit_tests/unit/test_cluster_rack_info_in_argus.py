@@ -50,6 +50,7 @@ class _ScyllaCluster(BaseScyllaCluster, BaseCluster):
     parallel_startup = True
 
     def __init__(self, nodes_count=0):  # skip the full cluster __init__
+        self.name = "db-cluster"
         self.log = MagicMock()
         self.nodes = [_Node(f"node-{idx}", parent_cluster=self) for idx in range(nodes_count)]
         # what a node finds when it has to run `nodetool status` on itself
@@ -169,6 +170,7 @@ class _LoaderSet(BaseCluster):
     parallel_startup = True
 
     def __init__(self, nodes):  # skip the full cluster __init__
+        self.name = "loader-set"
         self.log = MagicMock()
         self.nodes = nodes
         self.node_setup = MagicMock()
