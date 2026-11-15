@@ -5954,7 +5954,7 @@ class ClusterNodesNotReady(Exception):
 
 
 # cap of the threads that check the nodes of a cluster at the same time, each thread opens its own SSH connection
-NODES_CHECK_MAX_WORKERS = 20
+NODES_CHECK_MAX_WORKERS = 50
 
 
 def _check_nodes_in_parallel(check: Callable[[BaseNode], Any], nodes: list[BaseNode]) -> None:
