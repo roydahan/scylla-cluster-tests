@@ -4705,7 +4705,7 @@ class DeadNode:
 
 # cap of the threads that do the teardown work of the nodes of a cluster at the same time, each thread opens its own
 # SSH connection, so a cluster of hundreds of nodes gets a fixed number of threads instead of one for each node
-TEARDOWN_NODES_MAX_WORKERS = 20
+TEARDOWN_NODES_MAX_WORKERS = 50
 
 
 def run_teardown_on_nodes(func: Callable[[BaseNode], Any], nodes: Iterable[BaseNode]) -> list[Any]:
