@@ -603,6 +603,14 @@ class BaseNode(AutoSshContainerMixin):
             LOGGER.debug("Node rack name: %s", self._node_rack)
         return self._node_rack
 
+    def cache_dc_and_rack_names(self, dc_name: str | None, rack_name: str | None) -> None:
+        """Keep the names that `nodetool status` of another node reported for this node.
+
+        `datacenter` and `node_rack` then return them without running `nodetool status` on this node.
+        """
+        self._datacenter_name = self._datacenter_name or dc_name
+        self._node_rack = self._node_rack or rack_name
+
     @property
     def network_interfaces(self):
         raise NotImplementedError()
@@ -5924,12 +5932,14 @@ def wait_for_init_wrap(method):
             # Check DB nodes for UN
             if isinstance(cl_inst, BaseScyllaCluster):
                 cl_inst.wait_for_nodes_up_and_normal(nodes=node_list, verification_node=node_list[0], timeout=timeout)
-            for node in node_list:
-                try:
-                    node.update_rack_info_in_argus(node.datacenter, node.node_rack)
-                except Exception:  # noqa: BLE001
-                    LOGGER.warning("Failure settings dc/rack infomration for %s in Argus.", node)
-                    LOGGER.debug("Exception details:\n", exc_info=True)
+                cl_inst.update_rack_info_in_argus(nodes=node_list, verification_node=node_list[0])
+            else:
+                for node in node_list:
+                    try:
+                        node.update_rack_info_in_argus(node.datacenter, node.node_rack)
+                    except Exception:  # noqa: BLE001
+                        LOGGER.warning("Failure settings dc/rack infomration for %s in Argus.", node)
+                        LOGGER.debug("Exception details:\n", exc_info=True)
 
         time_elapsed = time.perf_counter() - start_time
         cl_inst.log.debug("TestConfig duration -> %s s", int(time_elapsed))
@@ -6472,6 +6482,32 @@ class BaseScyllaCluster:
             return node_status
         status = self.get_nodetool_status(verification_node=verification_node, dc_aware=False)
         return status.get(ip_address, None)
+
+    def update_rack_info_in_argus(
+        self, nodes: list[BaseNode] | None = None, verification_node: BaseNode | None = None
+    ) -> None:
+        """Report the datacenter and the rack names of `nodes` to Argus.
+
+        `node.datacenter` and `node.node_rack` each run `nodetool status` on the node itself, which takes about
+        1.4s per node when the nodes are asked one by one. The names of all the nodes are read from one
+        `nodetool status` of `verification_node` instead; a node that is missing from it is still asked itself.
+        """
+        nodes = self.nodes if nodes is None else nodes
+        if not nodes:
+            return
+        status = (verification_node or nodes[0]).get_nodes_status(nodes=nodes)
+        for node in nodes:
+            node_status = status.get(node, {})
+            node.cache_dc_and_rack_names(dc_name=node_status.get("dc"), rack_name=node_status.get("rack"))
+
+        def update_node(node: BaseNode) -> None:
+            try:
+                node.update_rack_info_in_argus(node.datacenter, node.node_rack)
+            except Exception:  # noqa: BLE001
+                LOGGER.warning("Failure settings dc/rack infomration for %s in Argus.", node)
+                LOGGER.debug("Exception details:\n", exc_info=True)
+
+        self.run_func_parallel(func=update_node, node_list=nodes)
 
     def wait_for_nodes_up_and_normal(self, nodes=None, verification_node=None, iterations=60, sleep_time=3, timeout=0):
         @retrying(
