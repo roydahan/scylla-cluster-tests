@@ -203,7 +203,7 @@ class LongevityTest(ClusterTester, loader_utils.LoaderUtilsMixin):
 
         # By default the cluster is grown before the main load starts. With `grow_cluster_during_stress`
         # the main load is started first and the nodes are added under it.
-        grow_during_stress = self.params.get("grow_cluster_during_stress")
+        grow_during_stress = self.params.get("cluster_target_size") and self.params.get("grow_cluster_during_stress")
         if not grow_during_stress:
             self._grow_cluster_to_target_size()
 
@@ -242,6 +242,7 @@ class LongevityTest(ClusterTester, loader_utils.LoaderUtilsMixin):
 
         # The stress threads and the nemesis are already running; add the nodes under them. This returns
         # only when the last stress_cmd round ended, so a nemesis started after it would never run.
+        # The last round is one more stress_cmd round, on the full-size cluster.
         if grow_during_stress:
             self._grow_cluster_under_stress(stress_queue, stress_round, keyspace_num)
 
@@ -268,28 +269,36 @@ class LongevityTest(ClusterTester, loader_utils.LoaderUtilsMixin):
         `stress_round` holds the stress_cmd threads that are already running. Each new round is appended to
         `stress_queue` too, so every round is verified with the rest of the load.
 
+        The last round is the one that started after the cluster reached its target size, so the full-size
+        cluster gets a full round of the load and the nemesis.
+
         A round that failed is not run again: it would fail again every few seconds for as long as the growth
         lasts. The cluster then keeps growing without the stress_cmd load.
         """
         with concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="GrowCluster") as executor:
             growth = executor.submit(self._grow_cluster_to_target_size)
+            started_after_growth = False  # the first round started before the growth
             # An empty round (no stress_cmd, or main_load skipped) has nothing to re-run: just wait for the growth.
             while stress_round:
                 concurrent.futures.wait([future for thread in stress_round for future in thread.results_futures])
-                if growth.done():
+                grown = growth.done()
+                if started_after_growth or (grown and growth.exception()):
                     break
                 if not all([self.verify_stress_thread(thread) for thread in stress_round]):
                     TestFrameworkEvent(
                         source=self.__class__.__name__,
                         source_method="_grow_cluster_under_stress",
-                        message="stress_cmd failed before the cluster reached its target size. It is not run "
-                        "again, and the cluster keeps growing without this load",
+                        message="stress_cmd failed, so it is not run again"
+                        + ("" if grown else ". The cluster keeps growing without this load"),
                         severity=Severity.ERROR,
                     ).publish()
                     break
                 InfoEvent(
-                    message="stress_cmd finished before the cluster reached its target size, running it again"
+                    message="The cluster reached its target size, running stress_cmd once more on the full-size cluster"
+                    if grown
+                    else "stress_cmd finished before the cluster reached its target size, running it again"
                 ).publish()
+                started_after_growth = grown
                 stress_round_start = len(stress_queue)
                 self.assemble_and_run_all_stress_cmd(stress_queue, self.params.get("stress_cmd"), keyspace_num)
                 stress_round = stress_queue[stress_round_start:]

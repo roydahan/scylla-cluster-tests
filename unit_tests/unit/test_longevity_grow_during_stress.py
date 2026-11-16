@@ -91,6 +91,15 @@ def test_growth_order_relative_to_stress(grow_during_stress, expected_order):
     assert test.calls == expected_order
 
 
+def test_without_a_target_size_the_flag_keeps_the_old_order():
+    test = _OrderRecordingLongevityTest(_params(grow_cluster_during_stress=True, cluster_target_size=None))
+
+    test.test_custom_time()
+
+    # the growth has nothing to add; without this the stress_cmd would get its extra round for nothing
+    assert test.calls == ["prepare", "grow", "stress", "nemesis"]
+
+
 def _cluster_with_nodes(sizes_per_dc):
     cluster = MagicMock()
     cluster.data_nodes = [MagicMock(dc_idx=dc_idx) for dc_idx, size in enumerate(sizes_per_dc) for _ in range(size)]
@@ -143,7 +152,7 @@ def _finish_after_growth(thread: SimpleNamespace, growth_returned: threading.Eve
 
 
 def _no_rerun_expected(number):
-    raise AssertionError(f"stress_cmd was run again (round {number + 1}) although the growth had finished")
+    raise AssertionError(f"stress_cmd was run again (round {number + 1}) although no more rounds were expected")
 
 
 class _RoundsLongevityTest(LongevityTest):
@@ -179,9 +188,10 @@ def error_event(monkeypatch):
     return event
 
 
-def test_stress_is_run_again_until_the_growth_finishes():
+def test_stress_is_run_again_until_the_growth_finishes_and_once_more_after_it():
     third_round_started, growth_returned = threading.Event(), threading.Event()
-    last_round = _stress_thread(done=False)
+    round_that_outlives_the_growth = _stress_thread(done=False)
+    round_on_the_full_size_cluster = _stress_thread()
 
     def grow():
         third_round_started.wait(timeout=10)  # the growth outlasts two re-runs of stress_cmd
@@ -192,8 +202,10 @@ def test_stress_is_run_again_until_the_growth_finishes():
             return _stress_thread()
         if number == 2:
             third_round_started.set()
-            _finish_after_growth(last_round, growth_returned)
-            return last_round
+            _finish_after_growth(round_that_outlives_the_growth, growth_returned)
+            return round_that_outlives_the_growth
+        if number == 3:
+            return round_on_the_full_size_cluster
         return _no_rerun_expected(number)
 
     test = _RoundsLongevityTest(grow, make_round)
@@ -202,21 +214,25 @@ def test_stress_is_run_again_until_the_growth_finishes():
 
     test._grow_cluster_under_stress(stress_queue, first_round, keyspace_num=1)
 
-    # the first round ended twice before the growth did; the round that outlived the growth is the last one
-    assert test.rounds == 2
-    assert len(stress_queue) == 3  # every round stays queued, to be verified with the rest of the load
-    assert stress_queue[-1] is last_round
+    # two rounds ended before the growth did, the third outlived it, and one more ran on the full-size cluster
+    assert test.rounds == 3
+    assert len(stress_queue) == 4  # every round stays queued, to be verified with the rest of the load
+    assert stress_queue[-2:] == [round_that_outlives_the_growth, round_on_the_full_size_cluster]
 
 
-def test_stress_is_not_run_again_once_the_growth_finished():
+def test_only_one_round_is_run_after_the_growth_finished():
     growth_returned = threading.Event()
     first_round = [_stress_thread(done=False)]
     _finish_after_growth(first_round[0], growth_returned)
-    test = _RoundsLongevityTest(growth_returned.set, make_round=_no_rerun_expected)
+
+    def make_round(number):
+        return _stress_thread() if number == 1 else _no_rerun_expected(number)
+
+    test = _RoundsLongevityTest(growth_returned.set, make_round)
 
     test._grow_cluster_under_stress(list(first_round), first_round, keyspace_num=1)
 
-    assert test.rounds == 0
+    assert test.rounds == 1
 
 
 @pytest.mark.parametrize("healthy_rounds", [0, 2], ids=["first-round-fails", "third-round-fails"])
@@ -243,6 +259,18 @@ def test_stress_is_not_run_again_after_a_round_failed(error_event, healthy_round
     error_event.return_value.publish.assert_called_once_with()
     assert error_event.call_args.kwargs["severity"] == Severity.ERROR
     assert growth_finished.is_set()  # the growth is still awaited, without the load
+
+
+def test_no_round_is_run_on_the_full_size_cluster_after_a_failed_round(error_event):
+    growth_returned = threading.Event()
+    first_round = [_stress_thread(done=False, failed=True)]
+    _finish_after_growth(first_round[0], growth_returned)
+    test = _RoundsLongevityTest(growth_returned.set, make_round=_no_rerun_expected)
+
+    test._grow_cluster_under_stress(list(first_round), first_round, keyspace_num=1)
+
+    assert test.rounds == 0
+    error_event.return_value.publish.assert_called_once_with()
 
 
 def test_growth_failure_is_raised_once_the_running_round_ends():
