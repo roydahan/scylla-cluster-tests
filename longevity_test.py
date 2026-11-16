@@ -46,6 +46,11 @@ from sdcm.utils.decorators import optional_stage
 from sdcm.utils.operations_thread import ThreadParams
 from sdcm.utils.parallel_object import ParallelObject
 
+# The name of the growth thread, and the name that reserves the joining nodes in the nemesis allocator.
+GROWTH_NAME = "GrowCluster"
+# How long a stopped test waits for the nodes of a growth batch that are being created, in seconds.
+GROWTH_BATCH_CREATION_TIMEOUT = 30 * 60
+
 
 class LongevityTest(ClusterTester, loader_utils.LoaderUtilsMixin):
     """Test a Scylla cluster stability over a time period."""
@@ -276,20 +281,23 @@ class LongevityTest(ClusterTester, loader_utils.LoaderUtilsMixin):
         A round that failed is not run again: it would fail again every few seconds for as long as the growth
         lasts. The cluster then keeps growing without the stress_cmd load.
 
-        When the test is stopped (a critical event raises in this thread), the growth is told to stop and is
-        not waited for: it adds no more batches, and the test goes to its teardown right away.
+        When the test is stopped (a critical event raises in this thread), the growth is told to stop: it adds
+        no more batches. Only a batch whose nodes are being created is waited for, see `_wait_for_batch_creation`.
         """
         stop_growth = threading.Event()
+        creating_batch = threading.Lock()
         growth = concurrent.futures.Future()
 
         def grow() -> None:
             try:
-                growth.set_result(self._grow_cluster_to_target_size(stop_event=stop_growth))
+                growth.set_result(
+                    self._grow_cluster_to_target_size(stop_event=stop_growth, creating_batch=creating_batch)
+                )
             except BaseException as exc:  # noqa: BLE001
                 growth.set_exception(exc)
 
         # A daemon thread, like the nemesis threads, so that a stopped test never waits for it.
-        threading.Thread(target=grow, name="GrowCluster", daemon=True).start()
+        threading.Thread(target=grow, name=GROWTH_NAME, daemon=True).start()
         try:
             started_after_growth = False  # the first round started before the growth
             # An empty round (no stress_cmd, or main_load skipped) has nothing to re-run: just wait for the growth.
@@ -319,43 +327,67 @@ class LongevityTest(ClusterTester, loader_utils.LoaderUtilsMixin):
             growth.result()
         finally:
             stop_growth.set()  # changes nothing once the growth ended
+            self._wait_for_batch_creation(creating_batch)
 
-    def _grow_cluster_to_target_size(self, stop_event: threading.Event | None = None) -> None:
+    def _wait_for_batch_creation(self, creating_batch: threading.Lock) -> None:
+        """Wait for the batch of nodes that the growth is creating, if any, before the teardown of a stopped test.
+
+        `add_nodes` registers the nodes of a batch in `db_cluster.nodes` one by one. The teardown stops the task
+        threads of the registered nodes only, and destroys only them. The bootstrap of a batch is not waited
+        for: its nodes are registered already.
+        """
+        if creating_batch.acquire(timeout=GROWTH_BATCH_CREATION_TIMEOUT):
+            creating_batch.release()
+        else:
+            self.log.warning(
+                "The growth is still creating nodes after %s seconds, the teardown can miss some of them",
+                GROWTH_BATCH_CREATION_TIMEOUT,
+            )
+
+    def _grow_cluster_to_target_size(
+        self, stop_event: threading.Event | None = None, creating_batch: threading.Lock | None = None
+    ) -> None:
         """Add nodes in batches of `add_node_cnt` per DC until every DC reaches `cluster_target_size`.
 
+        The new nodes are reserved in the nemesis allocator until they are up and normal: a nemesis that runs
+        during the growth must not pick a node that is still joining.
+
         Once `stop_event` is set, no more batches are added, and a batch whose nodes were just created is not
-        waited for.
+        waited for. `creating_batch` is held while the nodes of a batch are created.
         """
         if not (cluster_target_size := self.params.get("cluster_target_size")):
             return
         stop_event = stop_event or threading.Event()
-
-        def is_target_reached(current: list[int], target: list[int]) -> bool:
-            return all([x >= y for x, y in zip(current, target)])
+        creating_batch = creating_batch or threading.Lock()
 
         add_node_cnt = self.params.get("add_node_cnt")
         nodes_by_dcx = group_nodes_by_dc_idx(self.db_cluster.data_nodes)
-        current_cluster_size = [len(nodes_by_dcx[dcx]) for dcx in sorted(nodes_by_dcx)]
+        # Counted once, and not from the cluster size after each batch: that size also has the nodes that a
+        # nemesis adds for a while (GrowShrinkCluster), and the growth would then add fewer nodes.
+        nodes_to_add = [max(target - len(nodes_by_dcx[dcx]), 0) for dcx, target in enumerate(cluster_target_size)]
+        nodes_added = 0
 
         InfoEvent(
             message=f"Starting to grow cluster from {self.params.get('n_db_nodes')} to {cluster_target_size}"
         ).publish()
 
-        while not is_target_reached(current_cluster_size, cluster_target_size) and not stop_event.is_set():
+        while any(nodes_to_add) and not stop_event.is_set():
             added_nodes = []
-            for dcx, target in enumerate(cluster_target_size):
-                if current_cluster_size[dcx] < target:
-                    add_nodes_num = (
-                        add_node_cnt
-                        if (target - current_cluster_size[dcx]) >= add_node_cnt
-                        else target - current_cluster_size[dcx]
-                    )
-                    InfoEvent(message=f"Adding next number of nodes {add_nodes_num} to dc_idx {dcx}").publish()
-                    added_nodes.extend(
-                        self.db_cluster.add_nodes(
+            with creating_batch:
+                if stop_event.is_set():  # set while this thread was waiting for the lock
+                    break
+                for dcx, left_to_add in enumerate(nodes_to_add):
+                    if left_to_add:
+                        add_nodes_num = min(add_node_cnt, left_to_add)
+                        InfoEvent(message=f"Adding next number of nodes {add_nodes_num} to dc_idx {dcx}").publish()
+                        new_nodes = self.db_cluster.add_nodes(
                             count=add_nodes_num, enable_auto_bootstrap=True, dc_idx=dcx, rack=None
                         )
-                    )
+                        # Not with the `disruption_name` argument of add_nodes: not every backend accepts it.
+                        for node in new_nodes:
+                            self.nemesis_allocator.set_running_nemesis(node, GROWTH_NAME)
+                        added_nodes.extend(new_nodes)
+                        nodes_to_add[dcx] -= add_nodes_num
 
             if stop_event.is_set():
                 break
@@ -364,13 +396,18 @@ class LongevityTest(ClusterTester, loader_utils.LoaderUtilsMixin):
             with adaptive_timeout(Operations.NEW_NODE, node=self.db_cluster.data_nodes[0], timeout=up_timeout):
                 self.db_cluster.wait_for_init(node_list=added_nodes, timeout=up_timeout, check_node_health=False)
             self.db_cluster.wait_for_nodes_up_and_normal(nodes=added_nodes)
-            nodes_by_dcx = group_nodes_by_dc_idx(self.db_cluster.data_nodes)
-            current_cluster_size = [len(nodes_by_dcx[dcx]) for dcx in sorted(nodes_by_dcx)]
+            for node in added_nodes:
+                self.nemesis_allocator.unset_running_nemesis(node, GROWTH_NAME)
+            nodes_added += len(added_nodes)
 
         if stop_event.is_set():
             self.log.info("The test is being stopped, the cluster is not grown any further")
             return
-        InfoEvent(message=f"Growing cluster finished, new cluster size is {current_cluster_size}").publish()
+        nodes_by_dcx = group_nodes_by_dc_idx(self.db_cluster.data_nodes)
+        InfoEvent(
+            message=f"Growing cluster finished, {nodes_added} nodes were added,"
+            f" the cluster size is now {[len(nodes_by_dcx[dcx]) for dcx in sorted(nodes_by_dcx)]}"
+        ).publish()
 
     def test_batch_custom_time(self):
         """

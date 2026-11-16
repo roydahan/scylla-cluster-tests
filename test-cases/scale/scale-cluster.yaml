@@ -4,6 +4,9 @@ test_metadata:
     cassandra-stress write load, a read load over that dataset and SisyphusMonkey start, and the
     cluster is grown towards a target size in batches while they run, with fullscans throughout.
     The loads then run for one more round on the full-size cluster.
+    The dataset is small on purpose: these jobs test the number of nodes (topology changes, schema and
+    gossip at scale, under load and nemesis), not the data volume. Bootstrap that streams a large dataset
+    is left to the large-dataset longevity tests, whose nemeses add and replace nodes.
     Parameterised by the pipelines into the 15-25, 40-60, 180-200 and 450-500 node growth jobs.
   test_type: scale
   tier: tier2
