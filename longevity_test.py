@@ -21,6 +21,7 @@ import os
 import re
 import string
 import tempfile
+import threading
 from functools import cached_property
 from typing import Dict, List
 
@@ -274,9 +275,22 @@ class LongevityTest(ClusterTester, loader_utils.LoaderUtilsMixin):
 
         A round that failed is not run again: it would fail again every few seconds for as long as the growth
         lasts. The cluster then keeps growing without the stress_cmd load.
+
+        When the test is stopped (a critical event raises in this thread), the growth is told to stop and is
+        not waited for: it adds no more batches, and the test goes to its teardown right away.
         """
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="GrowCluster") as executor:
-            growth = executor.submit(self._grow_cluster_to_target_size)
+        stop_growth = threading.Event()
+        growth = concurrent.futures.Future()
+
+        def grow() -> None:
+            try:
+                growth.set_result(self._grow_cluster_to_target_size(stop_event=stop_growth))
+            except BaseException as exc:  # noqa: BLE001
+                growth.set_exception(exc)
+
+        # A daemon thread, like the nemesis threads, so that a stopped test never waits for it.
+        threading.Thread(target=grow, name="GrowCluster", daemon=True).start()
+        try:
             started_after_growth = False  # the first round started before the growth
             # An empty round (no stress_cmd, or main_load skipped) has nothing to re-run: just wait for the growth.
             while stress_round:
@@ -302,12 +316,19 @@ class LongevityTest(ClusterTester, loader_utils.LoaderUtilsMixin):
                 stress_round_start = len(stress_queue)
                 self.assemble_and_run_all_stress_cmd(stress_queue, self.params.get("stress_cmd"), keyspace_num)
                 stress_round = stress_queue[stress_round_start:]
-        growth.result()
+            growth.result()
+        finally:
+            stop_growth.set()  # changes nothing once the growth ended
 
-    def _grow_cluster_to_target_size(self) -> None:
-        """Add nodes in batches of `add_node_cnt` per DC until every DC reaches `cluster_target_size`."""
+    def _grow_cluster_to_target_size(self, stop_event: threading.Event | None = None) -> None:
+        """Add nodes in batches of `add_node_cnt` per DC until every DC reaches `cluster_target_size`.
+
+        Once `stop_event` is set, no more batches are added, and a batch whose nodes were just created is not
+        waited for.
+        """
         if not (cluster_target_size := self.params.get("cluster_target_size")):
             return
+        stop_event = stop_event or threading.Event()
 
         def is_target_reached(current: list[int], target: list[int]) -> bool:
             return all([x >= y for x, y in zip(current, target)])
@@ -320,7 +341,7 @@ class LongevityTest(ClusterTester, loader_utils.LoaderUtilsMixin):
             message=f"Starting to grow cluster from {self.params.get('n_db_nodes')} to {cluster_target_size}"
         ).publish()
 
-        while not is_target_reached(current_cluster_size, cluster_target_size):
+        while not is_target_reached(current_cluster_size, cluster_target_size) and not stop_event.is_set():
             added_nodes = []
             for dcx, target in enumerate(cluster_target_size):
                 if current_cluster_size[dcx] < target:
@@ -336,6 +357,8 @@ class LongevityTest(ClusterTester, loader_utils.LoaderUtilsMixin):
                         )
                     )
 
+            if stop_event.is_set():
+                break
             self.monitors.reconfigure_scylla_monitoring()
             up_timeout = MAX_TIME_WAIT_FOR_NEW_NODE_UP
             with adaptive_timeout(Operations.NEW_NODE, node=self.db_cluster.data_nodes[0], timeout=up_timeout):
@@ -344,6 +367,9 @@ class LongevityTest(ClusterTester, loader_utils.LoaderUtilsMixin):
             nodes_by_dcx = group_nodes_by_dc_idx(self.db_cluster.data_nodes)
             current_cluster_size = [len(nodes_by_dcx[dcx]) for dcx in sorted(nodes_by_dcx)]
 
+        if stop_event.is_set():
+            self.log.info("The test is being stopped, the cluster is not grown any further")
+            return
         InfoEvent(message=f"Growing cluster finished, new cluster size is {current_cluster_size}").publish()
 
     def test_batch_custom_time(self):
