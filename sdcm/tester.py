@@ -58,7 +58,6 @@ from sdcm.cluster import (
     NoMonitorSet,
     TestConfig,
     UserRemoteCredentials,
-    run_teardown_on_nodes,
 )
 from sdcm.cluster_aws import CassandraAWSCluster, LoaderSetAWS, MonitorSetAWS, ScyllaAWSCluster, VectorStoreSetAWS
 from sdcm.cluster_azure import LoaderSetAzure, MonitorSetAzure, ScyllaAzureCluster
@@ -1455,6 +1454,10 @@ class ClusterTester(unittest.TestCase):
 
             for future in as_completed(futures):
                 future.result()
+
+            if self.loaders and self.monitors:
+                # The monitors' setup may have written the loader targets before the loaders picked their port
+                self.monitors.reconfigure_scylla_monitoring()
 
             if self.params.get("use_ldap") and self.params.get("ldap_server_type") == LdapServerType.MS_AD:
                 if self.loaders:
@@ -3898,26 +3901,6 @@ class ClusterTester(unittest.TestCase):
         self.log.debug("All rows have been copied from %s to %s", src_table, dest_table)
         return True
 
-    def get_tables_id_of_keyspace(self, session, keyspace_name):
-        query = f"SELECT id FROM system_schema.tables WHERE keyspace_name='{keyspace_name}' "
-        table_id = self.rows_to_list(session.execute(query))
-        return table_id[0]
-
-    def get_tables_name_of_keyspace(self, session, keyspace_name):
-        query = f"SELECT table_name FROM system_schema.tables WHERE keyspace_name='{keyspace_name}' "
-        table_id = self.rows_to_list(session.execute(query))
-        return table_id[0]
-
-    def get_truncated_time_from_system_local(self, session):
-        query = "SELECT truncated_at FROM system.local"
-        truncated_time = self.rows_to_list(session.execute(query))
-        return truncated_time
-
-    def get_truncated_time_from_system_truncated(self, session, table_id):
-        query = f"SELECT truncated_at FROM system.truncated WHERE table_uuid={table_id}"
-        truncated_time = self.rows_to_list(session.execute(query))
-        return truncated_time[0]
-
     def get_describecluster_info(self) -> Optional[ClusterInformation]:
         """
         Runs the 'nodetool describecluster' command on a node.
@@ -3983,7 +3966,11 @@ class ClusterTester(unittest.TestCase):
             with silence(parent=self, name=f"stop_resources_stop_tasks_threads(cluster={cluster!s})"):
                 node.wait_till_tasks_threads_are_stopped()
 
-        run_teardown_on_nodes(wait_till_tasks_threads_are_stopped, nodes)
+        # the waits are mostly local, for threads that already got the stop signal, so the cap only keeps
+        # a cluster of hundreds of nodes from getting a thread for each node
+        ParallelObject(objects=nodes, timeout=None, num_workers=50, disable_logging=True).run(
+            wait_till_tasks_threads_are_stopped, ignore_exceptions=True
+        )
 
     @silence()
     def get_backtraces(self, cluster):

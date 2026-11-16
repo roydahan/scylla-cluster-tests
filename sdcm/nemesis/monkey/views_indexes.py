@@ -38,7 +38,7 @@ from sdcm.sct_events.group_common_events import (
     suppress_expected_unavailability_errors,
 )
 from sdcm.utils.adaptive_timeouts import Operations, adaptive_timeout
-from sdcm.utils.common import sleep_for_percent_of_duration
+from sdcm.utils.common import clear_snapshots, sleep_for_percent_of_duration
 from sdcm.utils.context_managers import DbNodeLogger
 from sdcm.utils.diagnostic_collector.handlers import EventExceptionHandler
 from sdcm.utils.diagnostic_collector.manager import collect_diagnostics
@@ -89,7 +89,12 @@ class CreateIndexNemesis(NemesisBaseClass):
                 raise UnsupportedNemesis("No table found to create index on")
             ks, cf = self.runner.random.choice(ks_cf_list).split(".")
             column = get_random_column_name(
-                session, ks, cf, filter_out_static_columns=True, filter_out_column_types=["counter"]
+                session,
+                ks,
+                cf,
+                filter_out_static_columns=True,
+                filter_out_column_types=["counter"],
+                random_generator=self.runner.random,
             )
             if not column:
                 raise UnsupportedNemesis("No column found to create index on")
@@ -126,6 +131,10 @@ class CreateIndexNemesis(NemesisBaseClass):
                 ):
                     self.runner.actions_log.info(f"Drop {index_name} index")
                     drop_index(session, ks, index_name)
+                with self.runner.action_log_scope(
+                    f"Clear {ks}.{index_name}_index pre-drop snapshots on all data nodes"
+                ):
+                    clear_snapshots(self.runner.cluster.data_nodes, "pre-drop-", ks, f"{index_name}_index")
 
 
 @target_data_nodes
@@ -173,7 +182,9 @@ class AddRemoveMvNemesis(NemesisBaseClass):
                     collect_diagnostics(MVDiagnosticCollector(session, exception_handler=EventExceptionHandler())),
                 ):
                     try:
-                        create_materialized_view_for_random_column(session, ks_name, base_table_name, view_name)
+                        create_materialized_view_for_random_column(
+                            session, ks_name, base_table_name, view_name, random_generator=self.runner.random
+                        )
                     except Exception as error:
                         self.runner.log.warning("Failed creating a materialized view: %s", error)
                         raise
@@ -200,6 +211,10 @@ class AddRemoveMvNemesis(NemesisBaseClass):
                     finally:
                         with self.runner.action_log_scope("Drop materialized view"):
                             drop_materialized_view(session, ks_name, view_name)
+                        with self.runner.action_log_scope(
+                            f"Clear {ks_name}.{view_name} pre-drop snapshots on all data nodes"
+                        ):
+                            clear_snapshots(self.runner.cluster.data_nodes, "pre-drop-", ks_name, view_name)
             except Exception:
                 # Covers both a failed cql_connection_patient (node never restarted otherwise) and
                 # any failure surfaced from inside the session block (start_scylla is a no-op if
@@ -256,7 +271,8 @@ class KillMVBuildingCoordinator(NemesisBaseClass):
 
         with (
             self.runner.node_allocator.run_nemesis(
-                node_list=self.runner.cluster.nodes, nemesis_label="Verification node for MV"
+                node_list=self.runner.cluster.nodes,
+                nemesis_label="Verification node for MV",
             ) as working_node,
             self.runner.cluster.cql_connection_patient(node=working_node, connect_timeout=600) as session,
             collect_diagnostics(MVDiagnosticCollector(session, exception_handler=EventExceptionHandler())),
@@ -264,10 +280,14 @@ class KillMVBuildingCoordinator(NemesisBaseClass):
             ks_name, base_table_name = self.runner.random.choice(ks_cfs).split(".")
             view_name = f"{base_table_name}_view_{str(uuid4())[:8]}"
             try:
-                column = create_materialized_view_for_random_column(session, ks_name, base_table_name, view_name)
+                column = create_materialized_view_for_random_column(
+                    session, ks_name, base_table_name, view_name, random_generator=self.runner.random
+                )
                 wait_materialized_view_building_tasks_started(session, ks_name, view_name)
             except ViewFinishedBuildingException:
                 drop_materialized_view(session, ks_name, view_name)
+                with self.runner.action_log_scope(f"Clear {ks_name}.{view_name} pre-drop snapshots on all data nodes"):
+                    clear_snapshots(self.runner.cluster.data_nodes, "pre-drop-", ks_name, view_name)
                 raise UnsupportedNemesis(
                     f"Skip nemesis because view {ks_name}.{view_name} has already finished building"
                 )
@@ -309,3 +329,5 @@ class KillMVBuildingCoordinator(NemesisBaseClass):
                     )
             finally:
                 drop_materialized_view(session, ks_name, view_name)
+                with self.runner.action_log_scope(f"Clear {ks_name}.{view_name} pre-drop snapshots on all data nodes"):
+                    clear_snapshots(self.runner.cluster.data_nodes, "pre-drop-", ks_name, view_name)

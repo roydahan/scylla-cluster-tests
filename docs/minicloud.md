@@ -41,7 +41,7 @@ are separate hydra invocations that all need to reach the same live endpoint.
 
 `configurations/minicloud.yaml` is **mandatory** for every minicloud run - layer it after the
 test-case yaml. It is the single delivery mechanism for the params the emulator requires:
-KMS off by default (aws and gce may opt in, see below), `instance_provision: on_demand` (no spot
+KMS off by default (any backend may opt in, see below), `instance_provision: on_demand` (no spot
 market), `ip_ssh_connections: private` (guests live on the host's userspace switch),
 shipped IO properties instead of iotune, AZ/region fallbacks off, and kernel-panic checker off.
 Scylla runs in production mode: the shipped IO properties satisfy its IO check, and each shard
@@ -176,9 +176,9 @@ exit-137 failure mode above if you were wrong.
 
 ## What minicloud does not implement
 
-- **KMS on azure, in SCT** - the overlay keeps KMS off on every backend. An aws or gce run may opt
-  in with `SCT_ENTERPRISE_DISABLE_KMS=false`. minicloud also emulates Azure Key Vault, but SCT does
-  not wire it up yet, so the preflight check rejects KMS on azure. No pipeline knows about KMS.
+- **KMS by default** - the overlay keeps KMS off on every backend. minicloud emulates AWS KMS,
+  GCP Cloud KMS and Azure Key Vault, so a run may opt in with `SCT_ENTERPRISE_DISABLE_KMS=false`.
+  No pipeline knows about KMS.
 - **Spot** - `instance_provision` must stay `on_demand`.
 - **Local SSDs / NVMe passthrough** - guests get qcow2-backed disks.
 - Anything not in the emulated API surface fails closed with an explicit error rather than
@@ -214,6 +214,41 @@ Minicloud* pipeline stage both call it; a direct (non-containerised) `sct.py sta
 does the same work in `sdcm/utils/minicloud/networking.py`.
 If you configure networking with a boot-time unit, that unit must include:
 `firewall-cmd --zone=trusted --change-interface=minicloud0`.
+
+### Running on macOS
+
+Docker on macOS cannot give a container access to Hypervisor.framework (HVF). On macOS, SCT
+starts the native `minicloud` binary as a host process instead of the container. The process keeps
+its PID in `~/.cache/minicloud/minicloud.pid` and writes its log to
+`~/.cache/minicloud/minicloud-native.log`.
+
+1. Install QEMU and minicloud with Homebrew:
+   ```bash
+   brew install qemu
+   brew tap scylladb/minicloud https://github.com/scylladb/minicloud
+   brew install --HEAD minicloud
+   ```
+   Do not start the `brew services` minicloud. SCT cannot check or stop a minicloud that it did not
+   start, so the run stops when that service holds the port.
+2. Install the `minicloud-tund` helper one time. It holds the `utun` device and the routes to the
+   guests:
+   ```bash
+   sudo MINICLOUD_VPC_ROUTES=10.160.0.0/11,172.31.0.0/16 "$(brew --prefix)/bin/minicloud-setup.sh" \
+     --tund "$(brew --prefix)/bin/minicloud-tund"
+   ```
+   The helper listens on `/var/run/minicloud-tund.sock`. Set `MINICLOUD_TUND_SOCKET` to use a
+   different path.
+3. Run the test in direct mode:
+   ```bash
+   SCT_SCYLLA_VERSION=2026.1 scripts/run-minicloud-test.sh -f provision -m direct
+   ```
+
+On macOS, `scripts/run-minicloud-test.sh` accepts only `-m direct`, because the native minicloud and
+its `utun` device are on the host, outside the hydra container. minicloud uses port 5050 on macOS,
+because AirPlay Receiver holds port 5000. The script also layers `configurations/minicloud/arm64.yaml`
+and `configurations/minicloud/macos.yaml`. The first selects arm64 instance types and removes the
+monitor node, and the second turns off guest memory locking. An arm64 host supports only the `aws`
+backend. The memory preflight reads the free and inactive pages from `vm_stat`.
 
 ### Guest network ranges
 
@@ -369,7 +404,7 @@ Unsupported APIs:
 
 | API | effect | handling |
 |---|---|---|
-| `Microsoft.KeyVault`, `Microsoft.ManagedIdentity` | VM create fails in the KMS provider | `enterprise_disable_kms: true` in `configurations/minicloud.yaml` |
+| `Microsoft.ManagedIdentity` | the VM identity block is accepted and ignored; the metadata service hands a token to any VM | nothing to do |
 | `purchasePlan` set for every URN | loader and monitor image download may be rejected | unverified |
 | community gallery and gallery listing | `scylla_version` cannot be resolved | pin a URN |
 | `virtualMachines/{vm}/restart`, `runCommand` | reboot nemeses fail (405) | QATOOLS-468; the provision test uses `not disruptive` |
@@ -382,6 +417,12 @@ The two standalone Azure jobs run on the lab KVM agent (`local_agent: true`). Th
 Azure comes with the size family, and the runner code reaches real Azure through
 `AzureService.real_cloud()` while every other ARM call stays redirected. minicloud uses the Azure
 credential only for the image download, SCT only for the runner itself.
+
+### Publish the run to Argus
+
+`scripts/run-minicloud-test.sh` sets `SCT_ENABLE_ARGUS=false`, so the run sends nothing to Argus. To
+show it in Argus, send its replay log with `argus run replay`. See [Upload a minicloud run to Argus](minicloud-argus-upload.md), which
+also covers the native macOS setup.
 
 ## Troubleshooting
 

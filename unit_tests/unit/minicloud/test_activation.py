@@ -14,7 +14,12 @@ from sdcm.utils.minicloud.activation import (
     validate_minicloud_params,
 )
 from sdcm.utils.minicloud.config import MinicloudError
-from sdcm.utils.minicloud.endpoint import MinicloudActivationError, get_minicloud_endpoint, is_minicloud_active
+from sdcm.utils.minicloud.endpoint import (
+    MINICLOUD_PORT,
+    MinicloudActivationError,
+    get_minicloud_endpoint,
+    is_minicloud_active,
+)
 from unit_tests.unit.minicloud.conftest import _patch_probe_session
 
 
@@ -82,7 +87,7 @@ def test_get_minicloud_endpoint_from_gce_env(monkeypatch):
 
 
 def test_get_minicloud_endpoint_default():
-    assert get_minicloud_endpoint() == "http://localhost:5000"
+    assert get_minicloud_endpoint() == f"http://localhost:{MINICLOUD_PORT}"
 
 
 def test_check_minicloud_reachability_success():
@@ -153,17 +158,17 @@ def test_validate_minicloud_params_rejects_missing_overlay():
         )
 
 
-def test_validate_minicloud_params_allows_kms_on_aws_and_gce_only():
+def test_validate_minicloud_params_allows_kms_on_minicloud_backends_only():
     params = {
         "instance_provision": "on_demand",
         "ip_ssh_connections": "private",
         "enterprise_disable_kms": False,
         "force_run_iotune": False,
     }
-    for backend in ("aws", "gce"):
+    for backend in ("aws", "gce", "azure"):
         validate_minicloud_params(params={**params, "cluster_backend": backend})
     with pytest.raises(MinicloudError, match="enterprise_disable_kms"):
-        validate_minicloud_params(params={**params, "cluster_backend": "azure"})
+        validate_minicloud_params(params={**params, "cluster_backend": "gce-siren"})
 
 
 def test_set_endpoint_env_exports_azure_vars_for_azure_backend():

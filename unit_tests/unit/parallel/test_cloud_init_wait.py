@@ -11,12 +11,7 @@
 #
 # Copyright (c) 2026 ScyllaDB
 
-"""The cloud-init wait in `provision_instances_with_fallback()` runs on all nodes concurrently.
-
-This is the path GCE, Azure and OCI provision through. Waiting node by node made provisioning time
-grow with the cluster size, so the waits must overlap, and a node whose cloud-init failed must still
-fail provisioning.
-"""
+"""The cloud-init wait in `provision_instances_with_fallback()`, which GCE, Azure and OCI provision through."""
 
 import threading
 from unittest.mock import MagicMock, patch
@@ -29,7 +24,7 @@ from sdcm.sct_provision.instances_provider import provision_instances_with_fallb
 from sdcm.utils.parallel_object import ParallelObjectException
 
 
-def _definition(index: int, use_public_ip: bool = False) -> InstanceDefinition:
+def definition(index: int, use_public_ip: bool = False) -> InstanceDefinition:
     return InstanceDefinition(
         name=f"node-{index}",
         image_id="image-1",
@@ -40,7 +35,7 @@ def _definition(index: int, use_public_ip: bool = False) -> InstanceDefinition:
     )
 
 
-def _instance(index: int) -> MagicMock:
+def vm(index: int) -> MagicMock:
     instance = MagicMock(
         public_ip_address=f"1.2.3.{index}",
         private_ip_address=f"10.0.0.{index}",
@@ -51,8 +46,8 @@ def _instance(index: int) -> MagicMock:
     return instance
 
 
-def _provision(definitions, instances, wait_side_effect):
-    """Drive the shared path with a stubbed provisioner; return the patched remoter class."""
+def provision(definitions, instances, wait_side_effect):
+    """Provision through a stubbed provisioner; return the result and the patched remoter class."""
     provisioner = MagicMock()
     provisioner.get_or_create_instances.return_value = instances
     with (
@@ -70,25 +65,24 @@ def _provision(definitions, instances, wait_side_effect):
 
 
 def test_cloud_init_waits_overlap():
+    """Provisioning fails unless the cloud-init waits of all the nodes run at the same time."""
     count = 4
     barrier = threading.Barrier(count, timeout=5)
+    instances = [vm(index) for index in range(1, count + 1)]
 
-    def wait(remoter, instance):
-        barrier.wait()  # raises BrokenBarrierError unless all the nodes are waited on at the same time
-
-    instances = [_instance(index) for index in range(1, count + 1)]
-
-    result, _ = _provision([_definition(index) for index in range(1, count + 1)], instances, wait)
+    result, _ = provision(
+        [definition(index) for index in range(1, count + 1)], instances, lambda remoter, instance: barrier.wait()
+    )
 
     assert result == instances
 
 
 def test_each_node_is_waited_on_once_at_its_own_address():
+    """Each node is waited on once, over SSH to the address its definition asks for."""
     waited = []
-    definitions = [_definition(1, use_public_ip=True), _definition(2, use_public_ip=False)]
-    instances = [_instance(1), _instance(2)]
+    definitions = [definition(1, use_public_ip=True), definition(2, use_public_ip=False)]
 
-    _, remoter_class = _provision(definitions, instances, lambda remoter, instance: waited.append(instance.name))
+    _, remoter_class = provision(definitions, [vm(1), vm(2)], lambda remoter, instance: waited.append(instance.name))
 
     assert sorted(waited) == ["node-1", "node-2"]
     hostnames = sorted(call.kwargs["hostname"] for call in remoter_class.create_remoter.call_args_list)
@@ -97,6 +91,7 @@ def test_each_node_is_waited_on_once_at_its_own_address():
 
 
 def test_cloud_init_failure_on_one_node_fails_provisioning():
+    """A cloud-init failure on one node fails provisioning with that error, after every node was waited on."""
     waited = []
 
     def wait(remoter, instance):
@@ -104,19 +99,16 @@ def test_cloud_init_failure_on_one_node_fails_provisioning():
         if instance.name == "node-2":
             raise CloudInitError("cloud-init failed on node-2")
 
-    definitions = [_definition(index) for index in range(1, 4)]
-    instances = [_instance(index) for index in range(1, 4)]
-
     with pytest.raises(ParallelObjectException) as error:
-        _provision(definitions, instances, wait)
+        provision([definition(index) for index in range(1, 4)], [vm(index) for index in range(1, 4)], wait)
 
-    # the failure names the node and keeps the underlying error, and no node was skipped
     assert "cloud-init failed on node-2" in str(error.value)
     assert sorted(waited) == ["node-1", "node-2", "node-3"]
 
 
 def test_no_instances_skips_the_wait():
-    result, remoter_class = _provision([], [], MagicMock(side_effect=AssertionError("must not be called")))
+    """Nothing is waited on when no instance was provisioned."""
+    result, remoter_class = provision([], [], MagicMock(side_effect=AssertionError("must not be called")))
 
     assert result == []
     remoter_class.create_remoter.assert_not_called()

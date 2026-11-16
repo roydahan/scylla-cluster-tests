@@ -78,15 +78,7 @@ TRANSIENT_EIP_RELEASE_ERRORS = ("InvalidNetworkInterfaceID.NotFound", "InvalidIP
 EIP_RELEASE_RETRIES = 8
 EIP_RELEASE_BACKOFF_THRESHOLD = 10
 
-# Max number of nodes to initialize concurrently in add_nodes. Caps threads/SSH sessions
-# and concurrent EC2 API calls on very large clusters.
 MAX_NODE_INIT_WORKERS = 20
-# Per-node timeout (seconds) passed to ParallelObject when creating + initializing nodes.
-# NOTE: ParallelObject applies this per future, not as a strict global wall-clock deadline
-# (see sdcm/utils/parallel_object.py). For clusters larger than MAX_NODE_INIT_WORKERS the
-# overflow nodes are queued, so the effective ceiling can be higher than this value.
-# node.init() waits for the instance to reach `running`, allocates/attaches an EIP, waits for
-# the public IP, then runs wait_ssh_up (up to 5min) and wait_for_cloud_init.
 NODE_INIT_TIMEOUT = 40 * 60
 
 P = ParamSpec("P")
@@ -660,8 +652,7 @@ class AWSCluster(cluster.BaseCluster):
                     ami_id=image_id,
                 )
             )
-        # Assign node_index/rack serially so node names, ordering and rack distribution stay
-        # deterministic and identical to the previous serial implementation.
+        # node_index and rack follow the instance order, whichever node finishes its init first.
         node_specs = []
         for node_index, instance in enumerate(instances):
             self._node_index += 1
@@ -686,24 +677,26 @@ class AWSCluster(cluster.BaseCluster):
                 node.config_ipv6_as_persistent()
             return node
 
-        # _create_node runs node.init(), which blocks per node on EC2 waiters (instance running,
-        # public IP), EIP allocation and SSH/cloud-init - previously done one node at a time, making
-        # provisioning grow linearly with cluster size (SCT-721). Initialize all nodes concurrently.
-        # ignore_exceptions=True so a failure on one node does not discard the nodes that succeeded:
-        # they must still be registered in self.nodes to be terminated during teardown. Nodes that
-        # fail init self-terminate via the @terminate_on_failure decorator on init().
+        # _create_node runs node.init(), which waits on EC2, SSH and cloud-init. The nodes that
+        # initialized go into self.nodes, in instance order, so teardown terminates them.
         results = ParallelObject(
             objects=node_specs,
             timeout=NODE_INIT_TIMEOUT,
             num_workers=min(len(node_specs), MAX_NODE_INIT_WORKERS),
         ).run(_create_and_init_node, ignore_exceptions=True)
-
-        # ParallelObject preserves submission order, so self.nodes keeps the original ordering.
         new_nodes = [result.result for result in results if result.exc is None]
         self.nodes.extend(new_nodes)
 
         if failed := [result for result in results if result.exc is not None]:
             self.log.error("Failed to initialize %s out of %s node(s)", len(failed), len(node_specs))
+            # These instances are not in self.nodes, so teardown would not terminate them. After a
+            # timeout some may still be initializing, and the queued ones never started.
+            for result in failed:
+                instance = result.obj[0]
+                try:
+                    instance.terminate()
+                except botocore.exceptions.ClientError as error:
+                    self.log.error("Failed to terminate instance %s: %s", instance.id, error)
             raise failed[0].exc
 
         self.write_node_public_ip_file()
@@ -1421,9 +1414,8 @@ class CassandraAWSCluster(BaseCassandraCluster, AWSCluster):
                 node=node,
             )
 
-        # Waiting for each node serially takes up to N * timeout, so wait for the nodes in
-        # parallel (SCT-730). run_func_parallel uses the default ThreadPoolExecutor size, so a
-        # cluster larger than that pool is waited on in batches, not in one timeout window.
+        # run_func_parallel uses the default ThreadPoolExecutor size, so a cluster larger than that
+        # pool is waited on in batches.
         self.run_func_parallel(func=_wait_for_node_db_up, node_list=node_list)
 
 
@@ -1635,9 +1627,7 @@ class VectorStoreSetAWS(VectorStoreClusterMixin, AWSCluster):
                 self.log.error("Failed to reconfigure Vector Store node %s: %s", node.name, e)
                 raise
 
-        # Each node reconfiguration is an independent set of SSH commands, so run them in
-        # parallel to cut the serial per-node provisioning latency (SCT-729). run_func_parallel
-        # re-raises the first exception via future.result(), preserving the fail-fast behavior.
+        # run_func_parallel re-raises the first failure once every node has finished.
         self.run_func_parallel(func=_reconfigure_node)
 
     def _create_node(

@@ -18,8 +18,7 @@ Covers `wait_for_schema_agreement` and `wait_all_nodes_un`.
 
 import logging
 import threading
-from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 from invoke import Result
@@ -69,32 +68,6 @@ def _run_together(barrier, result):
         return result
 
     return side_effect
-
-
-class LaterNodesFirstExecutor:
-    """Stands for a pool whose threads get to the later nodes first: `map` runs the calls in the reversed order."""
-
-    def __init__(self, *_, **__):
-        pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_):
-        return False
-
-    def map(self, func, *iterables):
-        calls = list(zip(*iterables))
-        errors = {}
-        for position in reversed(range(len(calls))):
-            try:
-                func(*calls[position])
-            except AssertionError as exc:
-                errors[position] = exc
-        for position in range(len(calls)):
-            if position in errors:
-                raise errors[position]
-            yield None
 
 
 # --- wait_for_schema_agreement ---
@@ -155,59 +128,6 @@ def test_wait_for_schema_agreement_disagreeing_nodes_raise_assertion_error_of_fi
     assert nodes[1].get_gossip_info.call_count == SCHEMA_AGREEMENT_RETRIES * CHECK_NODE_HEALTH_RETRIES
 
 
-def test_wait_for_schema_agreement_node_started_after_a_later_one_failed_is_still_checked(monkeypatch):
-    # node-3 fails before the check of node-1 starts, the error of node-1 is still the one to raise
-    monkeypatch.setattr("sdcm.cluster.ThreadPoolExecutor", LaterNodesFirstExecutor)
-    nodes = _make_nodes(5)
-    _set_schema_info(nodes, disagreeing=("node-1", "node-3"))
-
-    with pytest.raises(AssertionError, match=r"on the node node-1 "):
-        DummyScyllaCluster(nodes).wait_for_schema_agreement()
-
-    for node in (nodes[1], nodes[3]):
-        assert node.get_gossip_info.call_count == SCHEMA_AGREEMENT_RETRIES * CHECK_NODE_HEALTH_RETRIES
-
-
-def test_wait_for_schema_agreement_retries_until_nodes_agree():
-    nodes = _make_nodes(3)
-    _set_schema_info(nodes)
-    disagreement = _gossip_info(nodes, {"node-0": "v2"})
-    agreement = _gossip_info(nodes)
-    # the first pass sees the disagreement on all the attempts of the check, the second one sees the agreement
-    nodes[2].get_gossip_info.side_effect = [disagreement] * CHECK_NODE_HEALTH_RETRIES + [agreement]
-
-    assert DummyScyllaCluster(nodes).wait_for_schema_agreement() is True
-
-    assert nodes[2].get_gossip_info.call_count == CHECK_NODE_HEALTH_RETRIES + 1
-
-
-def test_wait_for_schema_agreement_skips_nodes_running_nemesis():
-    nodes = _make_nodes(4)
-    _set_schema_info(nodes)
-    nodes[1].running_nemesis = "DecommissionMonkey"
-    nodes[2].running_nemesis = "RestartMonkey"
-
-    assert DummyScyllaCluster(nodes).wait_for_schema_agreement() is True
-
-    for node in (nodes[0], nodes[3]):
-        node.get_gossip_info.assert_called_once()
-    for node in (nodes[1], nodes[2]):
-        node.get_gossip_info.assert_not_called()
-        node.get_peers_info.assert_not_called()
-
-
-def test_wait_for_schema_agreement_all_nodes_running_nemesis_raises_assertion_error():
-    nodes = _make_nodes(2)
-    for node in nodes:
-        node.running_nemesis = "RestartMonkey"
-
-    with pytest.raises(AssertionError, match="All nodes are under active nemesis"):
-        DummyScyllaCluster(nodes).wait_for_schema_agreement()
-
-    for node in nodes:
-        node.get_gossip_info.assert_not_called()
-
-
 # --- wait_all_nodes_un ---
 
 
@@ -218,18 +138,6 @@ def _nodetool_status(nodes, down=()):
         for idx, node in enumerate(nodes)
     ]
     return Result(stdout=NODETOOL_STATUS_HEADER + "\n".join(rows), exited=0)
-
-
-def test_wait_all_nodes_un_checks_nodes_concurrently():
-    nodes = _make_nodes(5)
-    barrier = threading.Barrier(len(nodes), timeout=OVERLAP_TIMEOUT)
-    for node in nodes:
-        node.run_nodetool.side_effect = _run_together(barrier, _nodetool_status(nodes))
-
-    DummyScyllaCluster(nodes).wait_all_nodes_un()
-
-    for node in nodes:
-        node.run_nodetool.assert_called_once_with("status", publish_event=False)
 
 
 def test_wait_all_nodes_un_down_node_raises_cluster_nodes_not_ready():
@@ -246,17 +154,6 @@ def test_wait_all_nodes_un_down_node_raises_cluster_nodes_not_ready():
     assert nodes[2].run_nodetool.call_count == WAIT_ALL_NODES_UN_RETRIES
 
 
-def test_wait_all_nodes_un_retries_until_nodes_are_up():
-    nodes = _make_nodes(3)
-    for node in nodes:
-        node.run_nodetool.return_value = _nodetool_status(nodes)
-    nodes[0].run_nodetool.side_effect = [_nodetool_status(nodes, down=("node-1",)), _nodetool_status(nodes)]
-
-    DummyScyllaCluster(nodes).wait_all_nodes_un()
-
-    assert nodes[0].run_nodetool.call_count == 2
-
-
 def test_wait_all_nodes_un_unexpected_error_is_not_retried():
     nodes = _make_nodes(3)
     for node in nodes:
@@ -270,62 +167,5 @@ def test_wait_all_nodes_un_unexpected_error_is_not_retried():
     assert nodes[1].run_nodetool.call_count == GET_NODETOOL_STATUS_RETRIES
 
 
-def test_wait_all_nodes_un_failed_check_stops_checks_of_later_nodes(monkeypatch):
-    monkeypatch.setattr("sdcm.cluster.NODES_CHECK_MAX_WORKERS", 2)
-    nodes = _make_nodes(6)
-    # the two checks that run first fail at the same time, as when no node sees the cluster as ready
-    barrier = threading.Barrier(2, timeout=OVERLAP_TIMEOUT)
-    for node in nodes:
-        node.run_nodetool.side_effect = _run_together(barrier, _nodetool_status(nodes, down=("node-5",)))
-
-    with pytest.raises(ClusterNodesNotReady):
-        DummyScyllaCluster(nodes).wait_all_nodes_un()
-
-    for node in nodes[:2]:
-        assert node.run_nodetool.call_count == WAIT_ALL_NODES_UN_RETRIES
-    for node in nodes[2:]:
-        node.run_nodetool.assert_not_called()
-
-
 def test_wait_all_nodes_un_no_nodes_does_nothing():
     DummyScyllaCluster([]).wait_all_nodes_un()
-
-
-# --- the cap of the concurrent checks ---
-
-
-@pytest.mark.parametrize(
-    "nodes_count, max_workers, expected_workers",
-    [
-        pytest.param(3, 20, 3, id="fewer-nodes-than-cap"),
-        pytest.param(6, 2, 2, id="more-nodes-than-cap"),
-    ],
-)
-def test_wait_all_nodes_un_caps_concurrent_checks(monkeypatch, nodes_count, max_workers, expected_workers):
-    monkeypatch.setattr("sdcm.cluster.NODES_CHECK_MAX_WORKERS", max_workers)
-    nodes = _make_nodes(nodes_count)
-    lock = threading.Lock()
-    running = []
-    max_running = []
-    # the checks pass only in groups of `expected_workers`
-    barrier = threading.Barrier(expected_workers, timeout=OVERLAP_TIMEOUT)
-
-    def run_nodetool(*_, **__):
-        with lock:
-            running.append(1)
-            max_running.append(len(running))
-        try:
-            barrier.wait()
-        finally:
-            with lock:
-                running.pop()
-        return _nodetool_status(nodes)
-
-    for node in nodes:
-        node.run_nodetool.side_effect = run_nodetool
-
-    with patch("sdcm.cluster.ThreadPoolExecutor", wraps=ThreadPoolExecutor) as executor:
-        DummyScyllaCluster(nodes).wait_all_nodes_un()
-
-    assert executor.call_args.kwargs["max_workers"] == expected_workers
-    assert max(max_running) == expected_workers

@@ -64,11 +64,12 @@ def set_params(runner):
 
 @pytest.fixture(autouse=True)
 def stub_common_helpers():
-    """Stub the ``utils.common`` internals: DbNodeLogger opens SSH sessions to every
-    node, and the SStable pick has to be deterministic.
+    """Stub the ``utils.common`` internals: DbNodeLogger opens SSH sessions to every node.
+
+    The SStable pick goes through ``runner.random``, which the shared ``runner`` fixture
+    already makes deterministic.
     """
-    with patch(f"{COMMON_MODULE}.DbNodeLogger"), patch(f"{COMMON_MODULE}.random") as mock_random:
-        mock_random.choice.side_effect = lambda seq: seq[0]
+    with patch(f"{COMMON_MODULE}.DbNodeLogger"):
         yield
 
 
@@ -230,6 +231,44 @@ def test_mgmt_backup_raises_when_no_bucket_location(runner, set_params):
 
     with pytest.raises(UnsupportedNemesis, match="backup bucket location"):
         mgmt_backup(runner, backup_specific_tables=False)
+
+
+@pytest.fixture()
+def backup_mgr_cluster(runner):
+    """Manager cluster of ``runner`` with no previous backup tasks, whose new backup task finishes successfully."""
+    mgr_cluster = runner.cluster.get_cluster_manager.return_value
+    mgr_cluster.backup_task_list = []
+    mgr_cluster.create_backup_task.return_value.wait_and_get_final_status.return_value = TaskStatus.DONE
+    runner.cluster.get_test_keyspaces.return_value = ["keyspace1", '"Keyspace2"']
+    with patch(f"{MODULE}.backup_bucket_region", return_value="us-east-1"):
+        yield mgr_cluster
+
+
+@pytest.mark.parametrize(
+    "backup_keyspaces, backup_specific_tables, expected_keyspace_list",
+    [
+        pytest.param(None, False, None, id="all-keyspaces"),
+        pytest.param(None, True, ["keyspace1", "Keyspace2"], id="test-keyspaces"),
+        pytest.param(["ks.table1", "ks.table2"], False, ["ks.table1", "ks.table2"], id="patterns-over-all-keyspaces"),
+        pytest.param(["ks.table1"], True, ["ks.table1"], id="patterns-over-test-keyspaces"),
+    ],
+)
+def test_mgmt_backup_keyspace_list(
+    runner, set_params, backup_mgr_cluster, backup_keyspaces, backup_specific_tables, expected_keyspace_list
+):
+    """mgmt_backup() backs up the 'mgmt_backup_keyspaces' patterns when set, and otherwise what the nemesis asks."""
+    set_params(
+        use_mgmt=True,
+        backup_bucket_backend="s3",
+        backup_bucket_location=["manager-backup-tests-{region}"],
+        mgmt_backup_keyspaces=backup_keyspaces,
+    )
+
+    mgmt_backup(runner, backup_specific_tables=backup_specific_tables)
+
+    backup_mgr_cluster.create_backup_task.assert_called_once_with(
+        location_list=["s3:manager-backup-tests-us-east-1"], keyspace_list=expected_keyspace_list
+    )
 
 
 # ---------------------------------------------------------------------------

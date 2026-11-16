@@ -11,188 +11,159 @@
 #
 # Copyright (c) 2026 ScyllaDB
 
-"""Reporting the datacenter and the rack names of the DB nodes to Argus after the nodes started.
+"""`wait_for_init` reports the datacenter and the rack name of every node it started to Argus."""
 
-`node.datacenter` and `node.node_rack` each run `nodetool status` on the node itself. `wait_for_init` asked the
-nodes for them one by one, about 1.4s per node; `BaseScyllaCluster.update_rack_info_in_argus` reads the names of
-all the nodes from one `nodetool status` instead.
-"""
-
+import threading
 from unittest.mock import MagicMock
 
 import pytest
 
-from sdcm.cluster import BaseCluster, BaseNode, BaseScyllaCluster, wait_for_init_wrap
+from sdcm.cluster import BaseCluster, wait_for_init_wrap
+from unit_tests.lib.fake_cluster import DummyScyllaCluster, NodetoolDummyNode
+
+STATUS_HEADER = (
+    "Status=Up/Down\n|/ State=Normal/Leaving/Joining/Moving\n--  Address  Load  Tokens  Owns  Host ID  Rack\n"
+)
+STATUS = (
+    f"Datacenter: eu-west\n===================\n{STATUS_HEADER}"
+    "UN  10.0.0.1  1.2 MB  256  ?  e5bcb094-e4de-43aa-8dc9-b1bf74b3b346  1a\n"
+    "UN  10.0.0.2  1.2 MB  256  ?  e5bcb094-e4de-43aa-8dc9-b1bf74b3b347  1b\n"
+    f"Datacenter: us-east\n===================\n{STATUS_HEADER}"
+    "UN  2a05:d018:223:f00::1  1.2 MB  256  ?  e5bcb094-e4de-43aa-8dc9-b1bf74b3b348  1c\n"
+)
+NAMES_IN_STATUS = {
+    "10.0.0.1": ("eu-west", "1a"),
+    "10.0.0.2": ("eu-west", "1b"),
+    "2a05:d018:223:f00::1": ("us-east", "1c"),
+}
 
 
-class _Node(BaseNode):
-    def __init__(self, name, parent_cluster):  # skip the full BaseNode.__init__
-        self.name = name
-        self.parent_cluster = parent_cluster
+class StartedNode(NodetoolDummyNode):
+    """A DB node that `wait_for_init` starts: Scylla is down until `node_startup`, and Argus is mocked."""
+
+    def __init__(self, ip, status=STATUS):
+        super().__init__(resp=status, myregion="eu-west-1", myname=ip, myrack=0, db_up=False)
         self._datacenter_name = None
         self._node_rack = None
+        self.remoter = MagicMock()
+        self.log = MagicMock()
+        self.run_nodetool = MagicMock(wraps=self.run_nodetool)
         self.update_rack_info_in_argus = MagicMock()
         self.update_shards_in_argus = MagicMock()
-        self.get_nodes_status = MagicMock(return_value={})
-        self._is_node_ready_run_scylla_commands = MagicMock(return_value=True)
-
-    region = "eu-west-1"
 
     def __str__(self):
         return self.name
 
     def reported_names(self):
+        """The names of the last report of this node to Argus."""
         return self.update_rack_info_in_argus.call_args.args
 
 
-class _ScyllaCluster(BaseScyllaCluster, BaseCluster):
+class StartedScyllaCluster(DummyScyllaCluster):
+    """A Scylla cluster that goes through `wait_for_init_wrap`, with the node setup and startup left out."""
+
     node_type = "scylla-db"
     parallel_startup = True
 
-    def __init__(self, nodes_count=0):  # skip the full cluster __init__
-        self.name = "db-cluster"
-        self.log = MagicMock()
-        self.nodes = [_Node(f"node-{idx}", parent_cluster=self) for idx in range(nodes_count)]
-        # what a node finds when it has to run `nodetool status` on itself
-        self.get_datacenter_name_per_region = MagicMock(return_value={_Node.region: "dc-asked"})
-        self.get_rack_names_per_datacenter_and_rack_idx = MagicMock(return_value={(_Node.region, "0"): "rack-asked"})
-        self.update_db_binary = MagicMock()
-        self.update_db_packages = MagicMock()
-        self.wait_for_nodes_up_and_normal = MagicMock()
-        self.node_setup = MagicMock()
-        self.node_startup = MagicMock()
+    def update_db_binary(self, *_, **__):
+        pass
+
+    def update_db_packages(self, *_, **__):
+        pass
+
+    def node_setup(self, node, **_):
+        pass
+
+    def node_startup(self, node, **_):
+        node._db_up = True
+
+    def wait_for_nodes_up_and_normal(self, *_, **__):
+        pass
 
     @wait_for_init_wrap
     def wait_for_init(self, node_list=None, timeout=None):
         pass
 
 
-def _status(nodes):
-    return {node: {"status": "UN", "dc": "dc-status", "rack": f"rack-{node.name}"} for node in nodes}
+@pytest.fixture
+def db_cluster():
+    """A cluster whose three nodes are all in the `nodetool status` that each of them returns."""
+    cluster = StartedScyllaCluster([StartedNode(ip) for ip in NAMES_IN_STATUS])
+    for node in cluster.nodes:
+        node.parent_cluster = cluster
+    return cluster
 
 
-def test_names_of_all_nodes_come_from_one_nodetool_status():
-    cluster = _ScyllaCluster(nodes_count=5)
-    verification_node = cluster.nodes[0]
-    verification_node.get_nodes_status.return_value = _status(cluster.nodes)
+def test_names_of_all_nodes_come_from_one_nodetool_status_of_the_first_node(db_cluster):
+    """One `nodetool status` of the first node gives the names of the nodes of both datacenters."""
+    db_cluster.wait_for_init(critical_node_setup_events=[])
 
-    cluster.update_rack_info_in_argus(nodes=cluster.nodes, verification_node=verification_node)
-
-    verification_node.get_nodes_status.assert_called_once_with(nodes=cluster.nodes)
-    for node in cluster.nodes[1:]:
-        node.get_nodes_status.assert_not_called()
-    # no node ran `nodetool status` on itself
-    cluster.get_datacenter_name_per_region.assert_not_called()
-    cluster.get_rack_names_per_datacenter_and_rack_idx.assert_not_called()
-    assert [node.reported_names() for node in cluster.nodes] == [
-        ("dc-status", f"rack-{node.name}") for node in cluster.nodes
-    ]
+    assert [node.run_nodetool.call_count for node in db_cluster.nodes] == [1, 0, 0]
+    assert {node.name: node.reported_names() for node in db_cluster.nodes} == NAMES_IN_STATUS
 
 
-def test_first_node_is_the_default_verification_node_and_all_cluster_nodes_the_default_nodes():
-    cluster = _ScyllaCluster(nodes_count=3)
-    cluster.nodes[0].get_nodes_status.return_value = _status(cluster.nodes)
+def test_node_that_the_status_does_not_list_asks_itself(db_cluster):
+    """A node that is missing from the status of the first node runs `nodetool status` on itself."""
+    own_status = f"Datacenter: eu-west\n===================\n{STATUS_HEADER}UN  10.0.0.9  1.2 MB  256  ?  e5bcb094-e4de-43aa-8dc9-b1bf74b3b349  1z\n"
+    missing = StartedNode("10.0.0.9", status=own_status)
+    missing.parent_cluster = db_cluster
+    db_cluster.nodes.append(missing)
 
-    cluster.update_rack_info_in_argus()
+    db_cluster.wait_for_init(critical_node_setup_events=[])
 
-    cluster.nodes[0].get_nodes_status.assert_called_once_with(nodes=cluster.nodes)
-    assert all(node.update_rack_info_in_argus.call_count == 1 for node in cluster.nodes)
-
-
-def test_node_missing_from_the_status_is_asked_itself():
-    cluster = _ScyllaCluster(nodes_count=3)
-    missing = cluster.nodes[2]
-    cluster.nodes[0].get_nodes_status.return_value = _status(cluster.nodes[:2])
-
-    cluster.update_rack_info_in_argus(nodes=cluster.nodes)
-
-    cluster.get_datacenter_name_per_region.assert_called_once_with(db_nodes=[missing])
-    cluster.get_rack_names_per_datacenter_and_rack_idx.assert_called_once_with(db_nodes=[missing])
-    assert missing.reported_names() == ("dc-asked", "rack-asked")
-    assert cluster.nodes[1].reported_names() == ("dc-status", "rack-node-1")
+    assert missing.run_nodetool.call_count == 2  # one for the datacenter name, one for the rack name
+    assert missing.reported_names() == ("eu-west", "1z")
+    assert [node.run_nodetool.call_count for node in db_cluster.nodes[:3]] == [1, 0, 0]
+    assert db_cluster.nodes[1].reported_names() == NAMES_IN_STATUS["10.0.0.2"]
 
 
-def test_names_a_node_already_knows_are_kept():
-    cluster = _ScyllaCluster(nodes_count=2)
-    known = cluster.nodes[1]
-    known.cache_dc_and_rack_names(dc_name="dc-known", rack_name="rack-known")
-    cluster.nodes[0].get_nodes_status.return_value = _status(cluster.nodes)
+def test_first_node_that_cannot_run_scylla_commands_is_not_asked(db_cluster):
+    """No `nodetool status` runs on a node with no SSH connection, as on Scylla Cloud without SSH access."""
+    for node in db_cluster.nodes:
+        node.remoter = None
 
-    cluster.update_rack_info_in_argus(nodes=cluster.nodes)
+    db_cluster.wait_for_init(critical_node_setup_events=[])
 
-    assert known.reported_names() == ("dc-known", "rack-known")
-
-
-def test_failure_of_one_node_does_not_stop_the_others():
-    cluster = _ScyllaCluster(nodes_count=3)
-    cluster.nodes[0].get_nodes_status.return_value = _status(cluster.nodes)
-    cluster.nodes[1].update_rack_info_in_argus.side_effect = RuntimeError("argus is down")
-
-    cluster.update_rack_info_in_argus(nodes=cluster.nodes)
-
-    assert all(node.update_rack_info_in_argus.call_count == 1 for node in cluster.nodes)
+    assert [node.run_nodetool.call_count for node in db_cluster.nodes] == [0, 0, 0]
+    assert [node.reported_names() for node in db_cluster.nodes] == [(None, None)] * 3
 
 
-def test_no_nodes_is_a_noop():
-    cluster = _ScyllaCluster(nodes_count=0)
+def test_node_whose_report_fails_does_not_stop_the_others(db_cluster):
+    """`wait_for_init` passes and the other nodes are reported when the report of one node raises."""
+    db_cluster.nodes[1].update_rack_info_in_argus.side_effect = RuntimeError("argus is down")
 
-    cluster.update_rack_info_in_argus(nodes=[])
+    db_cluster.wait_for_init(critical_node_setup_events=[])
 
-
-# --- wait_for_init_wrap ---
-
-
-def test_wait_for_init_reports_the_new_scylla_nodes_from_one_status_of_the_first_of_them():
-    cluster = _ScyllaCluster(nodes_count=4)
-    new_nodes = cluster.nodes[2:]
-    new_nodes[0].get_nodes_status.return_value = _status(new_nodes)
-    for node in new_nodes:  # Scylla is down during the node setup, so a node has no names to report then
-        node._is_node_ready_run_scylla_commands.return_value = False
-
-    def node_startup(node, **_):
-        node._is_node_ready_run_scylla_commands.return_value = True
-
-    cluster.node_startup.side_effect = node_startup
-
-    cluster.wait_for_init(node_list=new_nodes, critical_node_setup_events=[])
-
-    new_nodes[0].get_nodes_status.assert_called_once_with(nodes=new_nodes)
-    cluster.get_datacenter_name_per_region.assert_not_called()
-    cluster.get_rack_names_per_datacenter_and_rack_idx.assert_not_called()
-    for node in new_nodes:
-        # the last report of a node, after the nodes started
-        assert node.reported_names() == ("dc-status", f"rack-{node.name}")
-    for node in cluster.nodes[:2]:
-        node.update_rack_info_in_argus.assert_not_called()
+    assert db_cluster.nodes[0].reported_names() == NAMES_IN_STATUS["10.0.0.1"]
+    assert db_cluster.nodes[2].reported_names() == NAMES_IN_STATUS["2a05:d018:223:f00::1"]
 
 
-class _LoaderSet(BaseCluster):
-    parallel_startup = True
+def test_reports_of_the_nodes_run_at_the_same_time(db_cluster):
+    """The reports of the three nodes overlap: each one waits until all three have started."""
+    all_reports_started = threading.Barrier(len(db_cluster.nodes), timeout=5)
+    overlapped = []
 
-    def __init__(self, nodes):  # skip the full cluster __init__
-        self.name = "loader-set"
-        self.log = MagicMock()
-        self.nodes = nodes
-        self.node_setup = MagicMock()
-        self.node_startup = MagicMock()
+    def report(dc_name, _rack_name):
+        if dc_name:  # the report after the startup; the one of the node setup has no names yet
+            all_reports_started.wait()
+            overlapped.append(dc_name)
 
-    @wait_for_init_wrap
-    def wait_for_init(self, node_list=None, timeout=None):
-        pass
+    for node in db_cluster.nodes:
+        node.update_rack_info_in_argus.side_effect = report
+
+    db_cluster.wait_for_init(critical_node_setup_events=[])
+
+    assert len(overlapped) == len(db_cluster.nodes)
 
 
-@pytest.mark.parametrize("failing", [False, True], ids=["all-reported", "one-node-fails"])
-def test_wait_for_init_of_a_non_scylla_cluster_still_reports_every_node_itself(failing):
-    nodes = []
-    for idx in range(3):
-        node = MagicMock(datacenter="eu-west-1", node_rack=str(idx))
-        node.name = f"loader-{idx}"
-        nodes.append(node)
-    if failing:
-        nodes[0].update_rack_info_in_argus.side_effect = [None, RuntimeError("argus is down")]
+def test_nodes_of_a_cluster_that_is_not_a_scylla_cluster_are_reported_one_by_one():
+    """A loader set reports the names that each of its nodes gives, without the parallel run."""
+    loaders = [MagicMock(datacenter="eu-west-1", node_rack=str(idx)) for idx in range(3)]
+    loader_set = MagicMock(spec=BaseCluster, nodes=loaders, parallel_startup=True, log=MagicMock())
 
-    _LoaderSet(nodes).wait_for_init(critical_node_setup_events=[])
+    wait_for_init_wrap(MagicMock())(loader_set, critical_node_setup_events=[])
 
-    for idx, node in enumerate(nodes):
-        node.update_rack_info_in_argus.assert_called_with("eu-west-1", str(idx))
-        assert node.update_rack_info_in_argus.call_count == 2  # once in the node setup, once after the startup
+    for idx, loader in enumerate(loaders):
+        loader.update_rack_info_in_argus.assert_called_with("eu-west-1", str(idx))
+        assert loader.update_rack_info_in_argus.call_count == 2  # once in the node setup, once after the startup
+    loader_set.run_func_parallel.assert_not_called()

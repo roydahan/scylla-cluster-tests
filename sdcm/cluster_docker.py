@@ -826,9 +826,7 @@ class VectorStoreSetDocker(VectorStoreClusterMixin, DockerCluster):
                 self.log.error("Failed to reconfigure container %s: %s", node.name, e)
                 raise
 
-        # Each node reconfiguration is an independent container restart, so run them in
-        # parallel to cut the serial per-node provisioning latency (SCT-729). run_func_parallel
-        # re-raises the first exception via future.result(), preserving the fail-fast behavior.
+        # run_func_parallel re-raises the first failure once every node has finished.
         self.run_func_parallel(func=_reconfigure_node)
 
     def _create_node(self, node_index, container=None, after_config=None, rack=0):

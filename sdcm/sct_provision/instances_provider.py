@@ -40,15 +40,7 @@ from sdcm.utils.parallel_object import ParallelObject
 
 LOGGER = logging.getLogger(__name__)
 
-# Max number of nodes to wait on concurrently. Caps threads/SSH sessions on very large clusters.
 MAX_PROVISION_WAIT_WORKERS = 50
-# Per-node timeout (seconds) passed to ParallelObject when waiting on cloud-init.
-# NOTE: ParallelObject applies this per future, not as a strict global wall-clock deadline
-# (see sdcm/utils/parallel_object.py). For clusters larger than MAX_PROVISION_WAIT_WORKERS the
-# overflow nodes are queued, so the effective ceiling can be higher than this value.
-# This is only a backstop: wait_cloud_init_completes bounds itself. Each attempt waits up to 5min
-# for SSH and then up to CLOUD_INIT_WAIT_TIMEOUT (sdcm/provision/helpers/cloud_init.py) for
-# cloud-init, and an attempt that ends in CloudInitError is retried up to 20 times, 10s apart.
 PROVISION_WAIT_TIMEOUT = 30 * 60
 
 
@@ -140,13 +132,11 @@ def provision_instances_with_fallback(
         wait_cloud_init_completes(remoter=remoter, instance=v_m)
         # TODO: wait for scylla-machine-image service to complete if instance is scylla-db?
 
-    # Instances are created in parallel by the provisioner, but each node still needs an SSH
-    # connection and a (potentially multi-minute) cloud-init wait. Doing that serially made
-    # provisioning time grow linearly with cluster size, so wait for all nodes concurrently.
+    # Wait for cloud-init on all the nodes at once, at most MAX_PROVISION_WAIT_WORKERS at a time.
+    # wait_cloud_init_completes bounds each of its attempts, so PROVISION_WAIT_TIMEOUT is only a
+    # backstop. A failure on any node fails provisioning once the waits have ended.
     instance_pairs = list(zip(definitions, provisioned_instances))
     if instance_pairs:
-        # ignore_exceptions=False so any cloud-init failure still propagates (provisioning must fail
-        # if a node did not come up correctly), while ParallelObject surfaces it after all workers run.
         ParallelObject(
             objects=instance_pairs,
             timeout=PROVISION_WAIT_TIMEOUT,

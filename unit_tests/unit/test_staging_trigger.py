@@ -32,7 +32,7 @@ from utils.staging_trigger.interactive import (
     generate_yaml_config,
     maybe_set_docker_image,
 )
-from utils.staging_trigger.jenkins_client import parse_parameter_definitions
+from utils.staging_trigger.jenkins_client import JenkinsJobTrigger, parse_parameter_definitions
 from utils.staging_trigger.job_generation import _collect_folder_tree
 from utils.staging_trigger.trigger import (
     StagingTrigger,
@@ -1231,3 +1231,70 @@ class TestAutoSetDockerImageTrigger:
         params = {"scylla_version": "master:latest", "scylla_docker_image": "custom"}
         _auto_set_docker_image(params)
         assert params["scylla_docker_image"] == "custom"
+
+
+JOB_CONFIG_XML = """<flow-definition><properties><hudson.model.ParametersDefinitionProperty>
+<parameterDefinitions>
+  <hudson.model.StringParameterDefinition><name>backend</name><defaultValue>aws</defaultValue></hudson.model.StringParameterDefinition>
+  <hudson.model.StringParameterDefinition><name>scylla_version</name><defaultValue></defaultValue></hudson.model.StringParameterDefinition>
+  <hudson.model.StringParameterDefinition><name>requested_by_user</name><defaultValue></defaultValue></hudson.model.StringParameterDefinition>
+</parameterDefinitions>
+</hudson.model.ParametersDefinitionProperty></properties></flow-definition>"""
+
+
+@patch("utils.staging_trigger.jenkins_client.get_username", MagicMock(return_value="someone"))
+class TestJenkinsJobTriggerTrigger:
+    """trigger() sends only the parameters the job defines, and always a requested_by_user."""
+
+    @staticmethod
+    def _client(config_xml):
+        client = JenkinsJobTrigger.__new__(JenkinsJobTrigger)
+        client.jenkins = MagicMock()
+        client.jenkins.get_job_config.return_value = config_xml
+        client.jenkins.get_job_info.return_value = {"nextBuildNumber": 7}
+        return client
+
+    def test_drops_undefined_parameters(self):
+        client = self._client(JOB_CONFIG_XML)
+        params = {"scylla_version": "master:latest", "scylla_docker_image": "scylladb/scylla-nightly"}
+
+        assert client.trigger("folder/job", params) == 7
+
+        client.jenkins.build_job.assert_called_once_with(
+            name="folder/job", parameters={"scylla_version": "master:latest", "requested_by_user": "someone"}
+        )
+
+    def test_keeps_parameters_when_definitions_unknown(self):
+        client = self._client(None)
+        client.jenkins.get_job_config.side_effect = Exception("no config")
+        params = {"scylla_version": "master:latest", "scylla_docker_image": "x"}
+
+        client.trigger("folder/job", params)
+
+        client.jenkins.build_job.assert_called_once_with(
+            name="folder/job", parameters={**params, "requested_by_user": "someone"}
+        )
+
+    @pytest.mark.parametrize("params", [{}, {"requested_by_user": ""}], ids=["missing", "empty"])
+    def test_fills_requested_by_user(self, params):
+        client = self._client(JOB_CONFIG_XML)
+
+        client.trigger("folder/job", {"backend": "aws", **params})
+
+        client.jenkins.build_job.assert_called_once_with(
+            name="folder/job", parameters={"backend": "aws", "requested_by_user": "someone"}
+        )
+
+    def test_keeps_explicit_requested_by_user(self):
+        client = self._client(JOB_CONFIG_XML)
+
+        client.trigger("folder/job", {"requested_by_user": "other"})
+
+        client.jenkins.build_job.assert_called_once_with(name="folder/job", parameters={"requested_by_user": "other"})
+
+    def test_drops_requested_by_user_when_job_lacks_it(self):
+        client = self._client(JOB_CONFIG_XML.replace("requested_by_user", "other_param"))
+
+        client.trigger("folder/job", {"backend": "aws"})
+
+        client.jenkins.build_job.assert_called_once_with(name="folder/job", parameters={"backend": "aws"})

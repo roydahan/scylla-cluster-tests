@@ -86,7 +86,7 @@ from sdcm.logcollector import (
 from sdcm.mgmt import AnyManagerCluster, ScyllaManagerError
 from sdcm.mgmt.common import get_manager_repo, get_manager_scylla_backend
 from sdcm.monitorstack.ui import AlternatorDashboard, GeminiDashboard
-from sdcm.node_exporter_setup import NodeExporterSetup
+from sdcm.node_exporter_setup import NODE_EXPORTER_DEFAULT_PORT, NodeExporterSetup
 from sdcm.paths import (
     SCYLLA_MANAGER_AGENT_YAML_PATH,
     SCYLLA_MANAGER_TLS_CERT_FILE,
@@ -159,7 +159,7 @@ from sdcm.snitch_configuration import SnitchConfig
 from sdcm.test_config import TestConfig
 from sdcm.utils import cdc, properties
 from sdcm.utils.adaptive_timeouts import AdaptiveTimeoutStore, Operations, adaptive_timeout
-from sdcm.utils.apt import apt_cmd
+from sdcm.utils.apt import apt_cmd, apt_lock_wait
 from sdcm.utils.auto_ssh import AutoSshContainerMixin
 from sdcm.utils.aws_kms import AwsKms
 from sdcm.utils.azure_utils import AzureService
@@ -456,6 +456,8 @@ class BaseNode(AutoSshContainerMixin):
     journal_since: str | None = None
     # A host that outlives the run (bare metal) keeps one journal for every run on it
     journal_outlives_run: bool = False
+    # Where the host's node_exporter serves, set by NodeExporterSetup.install on loaders and monitors
+    node_exporter_port: int = NODE_EXPORTER_DEFAULT_PORT
 
     GOSSIP_STATUSES_FILTER_OUT = [
         "LEFT",  # in case the node was decommissioned
@@ -606,7 +608,12 @@ class BaseNode(AutoSshContainerMixin):
     def cache_dc_and_rack_names(self, dc_name: str | None, rack_name: str | None) -> None:
         """Keep the names that `nodetool status` of another node reported for this node.
 
-        `datacenter` and `node_rack` then return them without running `nodetool status` on this node.
+        `datacenter` and `node_rack` return a kept name without running `nodetool status` on this node.
+        A name that the node already has is not replaced.
+
+        Args:
+            dc_name: the datacenter name of this node, or None when it is not known.
+            rack_name: the rack name of this node, or None when it is not known.
         """
         self._datacenter_name = self._datacenter_name or dc_name
         self._node_rack = self._node_rack or rack_name
@@ -4703,29 +4710,6 @@ class DeadNode:
             self.ip = f"{self.public_ip} | {self.private_ip}{f' | {self.ipv6_ip}' if self.ipv6_ip else ''}"
 
 
-# cap of the threads that do the teardown work of the nodes of a cluster at the same time, each thread opens its own
-# SSH connection, so a cluster of hundreds of nodes gets a fixed number of threads instead of one for each node
-TEARDOWN_NODES_MAX_WORKERS = 50
-
-
-def run_teardown_on_nodes(func: Callable[[BaseNode], Any], nodes: Iterable[BaseNode]) -> list[Any]:
-    """Run `func(node)` for every node, on up to TEARDOWN_NODES_MAX_WORKERS nodes at the same time.
-
-    Returns the results in the order of `nodes`. `func` is expected to handle the failure of its own node.
-    Every node is processed anyway: an exception that gets out of `func` is raised once all the nodes are done,
-    the one of the first such node in the order of `nodes`.
-    """
-    nodes = list(nodes)
-    if not nodes:
-        return []
-    with ThreadPoolExecutor(
-        max_workers=min(len(nodes), TEARDOWN_NODES_MAX_WORKERS), thread_name_prefix="NodesTeardown"
-    ) as executor:
-        futures = [executor.submit(func, node) for node in nodes]
-        # leaving the `with` on an exception still waits for all the submitted nodes
-        return [future.result() for future in futures]
-
-
 class BaseCluster:
     """Cluster of Node objects."""
 
@@ -5036,18 +5020,13 @@ class BaseCluster:
         return results
 
     def get_backtraces(self):
-        def get_node_coredumps(node) -> int:
+        for node in self.nodes:
             try:
                 node.get_backtraces()
-                return node.n_coredumps
+                if node.n_coredumps > 0:
+                    self.coredumps[node.name] = node.n_coredumps
             except Exception as ex:
                 self.log.exception(f"Unable to get coredump status from node {node}: {ex}")
-                return 0
-
-        nodes = list(self.nodes)
-        for node, n_coredumps in zip(nodes, run_teardown_on_nodes(get_node_coredumps, nodes), strict=True):
-            if n_coredumps > 0:
-                self.coredumps[node.name] = n_coredumps
 
     def node_setup(self, node, verbose=False, timeout=3600):
         raise NotImplementedError("Derived class must implement 'node_setup' method!")
@@ -5850,6 +5829,13 @@ def wait_for_init_wrap(method):
             task_queue.put((_node, exception_details))
             task_queue.task_done()
 
+        def update_rack_info_in_argus(_node: BaseNode):
+            try:
+                _node.update_rack_info_in_argus(_node.datacenter, _node.node_rack)
+            except Exception:  # noqa: BLE001
+                LOGGER.warning("Failure setting dc/rack information for %s in Argus.", _node)
+                LOGGER.debug("Exception details:\n", exc_info=True)
+
         def verify_node_setup_or_startup(start_time, task_queue: queue.Queue, results: list):
             time_elapsed = time.perf_counter() - start_time
             try:
@@ -5871,8 +5857,8 @@ def wait_for_init_wrap(method):
                 )
             except queue.Empty:
                 pass
-            if timeout and time_elapsed / 60 > timeout:
-                msg = "TIMEOUT [%d min]: Waiting for node(-s) setup/startup(%d/%d) expired!" % (
+            if timeout and time_elapsed > timeout:
+                msg = "TIMEOUT [%d s]: Waiting for node(-s) setup/startup(%d/%d) expired!" % (
                     timeout,
                     len(results),
                     len(node_list),
@@ -5932,14 +5918,13 @@ def wait_for_init_wrap(method):
             # Check DB nodes for UN
             if isinstance(cl_inst, BaseScyllaCluster):
                 cl_inst.wait_for_nodes_up_and_normal(nodes=node_list, verification_node=node_list[0], timeout=timeout)
-                cl_inst.update_rack_info_in_argus(nodes=node_list, verification_node=node_list[0])
+                cl_inst.read_dc_and_rack_names(nodes=node_list, verification_node=node_list[0])
+                cl_inst.run_func_parallel(func=update_rack_info_in_argus, node_list=node_list)
             else:
+                # A node of another cluster type takes its rack name from the tester, which asks the DB cluster
+                # on every call, so these nodes are not asked all at once.
                 for node in node_list:
-                    try:
-                        node.update_rack_info_in_argus(node.datacenter, node.node_rack)
-                    except Exception:  # noqa: BLE001
-                        LOGGER.warning("Failure settings dc/rack infomration for %s in Argus.", node)
-                        LOGGER.debug("Exception details:\n", exc_info=True)
+                    update_rack_info_in_argus(node)
 
         time_elapsed = time.perf_counter() - start_time
         cl_inst.log.debug("TestConfig duration -> %s s", int(time_elapsed))
@@ -5961,32 +5946,15 @@ def _check_nodes_in_parallel(check: Callable[[BaseNode], Any], nodes: list[BaseN
     """Run `check(node)` for every node, on up to NODES_CHECK_MAX_WORKERS nodes at the same time.
 
     Raises the exception of the first failed node, in the order of `nodes`, the same one a serial loop
-    would raise. Once a check failed, no check of a later node starts, and the running ones are waited for.
+    would raise. Nodes after it may already be checked by then. The checks that did not start yet are
+    cancelled, and the running ones are waited for.
     """
     if not nodes:
         return
-    first_failed = len(nodes)
-    first_failed_lock = threading.Lock()
-
-    def check_unless_earlier_failed(position: int, node: BaseNode) -> None:
-        nonlocal first_failed
-        # `map` cancels the queued checks only after the caller sees the failure, and by then
-        # the workers that got free already took the next nodes.
-        # A node before the failed one is still checked: when it fails too, its error is the one to raise
-        if position > first_failed:
-            return
-        try:
-            check(node)
-        except BaseException:
-            with first_failed_lock:
-                first_failed = min(first_failed, position)
-            raise
-
     with ThreadPoolExecutor(
         max_workers=min(len(nodes), NODES_CHECK_MAX_WORKERS), thread_name_prefix="NodesCheck"
     ) as executor:
-        for _ in executor.map(check_unless_earlier_failed, range(len(nodes)), nodes):
-            pass
+        list(executor.map(check, nodes))
 
 
 class BaseScyllaCluster:
@@ -6322,8 +6290,6 @@ class BaseScyllaCluster:
             with node.remote_scylla_yaml() as scylla_yml:
                 scylla_yml.seed_provider = node.proposed_scylla_yaml.seed_provider
 
-        # Each node update is an independent SSH read+write of scylla.yaml, so run them in
-        # parallel to avoid the serial per-node latency during cluster provisioning (SCT-731).
         self.run_func_parallel(func=_update_node_seed_provider)
 
     def update_db_binary(self, node_list=None, start_service=True):
@@ -6487,31 +6453,22 @@ class BaseScyllaCluster:
         status = self.get_nodetool_status(verification_node=verification_node, dc_aware=False)
         return status.get(ip_address, None)
 
-    def update_rack_info_in_argus(
-        self, nodes: list[BaseNode] | None = None, verification_node: BaseNode | None = None
-    ) -> None:
-        """Report the datacenter and the rack names of `nodes` to Argus.
+    def read_dc_and_rack_names(self, nodes: list[BaseNode], verification_node: BaseNode) -> None:
+        """Read the datacenter and the rack names of `nodes` from one `nodetool status` and keep them on the nodes.
 
-        `node.datacenter` and `node.node_rack` each run `nodetool status` on the node itself, which takes about
-        1.4s per node when the nodes are asked one by one. The names of all the nodes are read from one
-        `nodetool status` of `verification_node` instead; a node that is missing from it is still asked itself.
+        A node that the status does not list keeps no name, and neither does any node when `verification_node`
+        cannot run Scylla commands. Such a node runs `nodetool status` on itself when it is asked for a name.
+
+        Args:
+            nodes: the nodes to keep the names on.
+            verification_node: the node that runs `nodetool status`.
         """
-        nodes = self.nodes if nodes is None else nodes
-        if not nodes:
+        if not verification_node._is_node_ready_run_scylla_commands():
             return
-        status = (verification_node or nodes[0]).get_nodes_status(nodes=nodes)
+        status = verification_node.get_nodes_status(nodes=nodes)
         for node in nodes:
             node_status = status.get(node, {})
             node.cache_dc_and_rack_names(dc_name=node_status.get("dc"), rack_name=node_status.get("rack"))
-
-        def update_node(node: BaseNode) -> None:
-            try:
-                node.update_rack_info_in_argus(node.datacenter, node.node_rack)
-            except Exception:  # noqa: BLE001
-                LOGGER.warning("Failure settings dc/rack infomration for %s in Argus.", node)
-                LOGGER.debug("Exception details:\n", exc_info=True)
-
-        self.run_func_parallel(func=update_node, node_list=nodes)
 
     def wait_for_nodes_up_and_normal(self, nodes=None, verification_node=None, iterations=60, sleep_time=3, timeout=0):
         @retrying(
@@ -6725,12 +6682,13 @@ class BaseScyllaCluster:
 
         def _rotate():
             azure_service = AzureService()
+            vault_uri = AzureKmsProvider.get_vault_uri(region, azure_service)
+            key_name = AzureKmsProvider.get_key_name_for_test(test_id)
 
             while True:
                 time.sleep(self.params.get("kms_key_rotation_interval") * 60)
                 try:
-                    key_uri = AzureKmsProvider.get_key_uri_for_test(region, test_id)
-                    rotated_key_id = azure_service.rotate_vault_key(key_uri)
+                    rotated_key_id = azure_service.rotate_vault_key(vault_uri, key_name)
                     self.log.info(f"Azure KMS key rotated for test {test_id}: {rotated_key_id}")
                 except AzureResourceNotFoundError as e:
                     self.log.error(f"Azure KMS key not found for rotation: {e}")
@@ -7200,10 +7158,16 @@ class BaseScyllaCluster:
         if check_node_health:
             node_list[0].check_node_health()
 
-    def restart_scylla(self, nodes=None, random_order=False):
+    def restart_scylla(self, nodes=None, random_order=False, *, random_generator: random.Random | None = None):
+        """Restart Scylla on ``nodes`` (all by default) one after another.
+
+        :param random_generator: shuffles the nodes when ``random_order`` is set. Nemesis code passes
+            ``NemesisRunner.random`` so the order replays from nemesis_seed; other callers leave it unset.
+        """
         nodes_to_restart = (nodes or self.nodes)[:]  # create local copy of nodes list
         if random_order:
-            random.shuffle(nodes_to_restart)
+            random_generator = random_generator or random.Random()
+            random_generator.shuffle(nodes_to_restart)
         self.log.info("Going to restart Scylla on %s", [n.name for n in nodes_to_restart])
         for node in nodes_to_restart:
             node.stop_scylla(verify_down=True)
@@ -7517,6 +7481,10 @@ class BaseLoaderSet:
         # update repo cache and system after system is up
         node.update_repo_cache()
 
+        # The address the monitor scrapes the loader at. A reused loader finds the exporter setup started, so the
+        # monitor's reconfigure_scylla_monitoring writes its target with the right port
+        node.node_exporter_port = NodeExporterSetup().install(node, scrape_host=normalize_ipv6_url(node.ip_address))
+
         if TestConfig().REUSE_CLUSTER:
             self.kill_stress_thread()
             reconfigure_vector_on_node(node, self.params, TestConfig())
@@ -7524,9 +7492,6 @@ class BaseLoaderSet:
                 self._generate_loader_certs(node)
                 install_client_certificate(node.remoter, node.ip_address, force=True)
             return
-
-        node_exporter_setup = NodeExporterSetup()
-        node_exporter_setup.install(node)
 
         if self.params.get("bare_loaders"):
             node.log.info("Don't install anything because bare loaders requested")
@@ -7806,6 +7771,8 @@ class BaseMonitorSet:
 
         if self.test_config.REUSE_CLUSTER:
             reconfigure_vector_on_node(node, self.params, self.test_config)
+            # Finds the exporter setup started: reconfigure_scylla_monitoring rewrites the monitor's target with its port
+            node.node_exporter_port = self.install_node_exporter(node)
             self.configure_scylla_monitoring(node)
             self.restart_scylla_monitoring(sct_metrics=True)
             set_grafana_url(f"http://{normalize_ipv6_url(node.external_address)}:{self.grafana_port}")
@@ -7918,24 +7885,7 @@ class BaseMonitorSet:
 
         node.update_repo_cache()
 
-        prereqs_script = dedent("""
-            # Function to wait for apt locks to be released
-            wait_for_apt_lock() {
-                echo "Waiting for apt locks to be released..."
-                local max_attempts=60
-                local attempt=0
-                while fuser /var/lib/apt/lists/lock /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock >/dev/null 2>&1; do
-                    if [ $attempt -ge $max_attempts ]; then
-                        echo "Timeout waiting for apt lock after $max_attempts attempts"
-                        exit 1
-                    fi
-                    echo "Apt is locked by another process, waiting... (attempt $((attempt+1))/$max_attempts)"
-                    sleep 10
-                    attempt=$((attempt+1))
-                done
-                echo "Apt locks are free, proceeding..."
-            }
-
+        prereqs_script = f"wait_for_apt_lock() {{ {apt_lock_wait(lock_timeout=600)}; }}\n" + dedent("""
             # Function to install Docker and Python basics on Debian/Ubuntu
             install_debian_pkgs() {
                 echo "Detected Debian/Ubuntu system..."
@@ -8028,8 +7978,7 @@ class BaseMonitorSet:
             fi
         """)
 
-        node_exporter_setup = NodeExporterSetup()
-        node_exporter_setup.install(node)
+        node.node_exporter_port = self.install_node_exporter(node)
 
         node.remoter.run(cmd="sudo bash -ce '%s'" % prereqs_script)
         node.remoter.run("sudo usermod -aG docker $USER", change_context=True)
@@ -8037,6 +7986,11 @@ class BaseMonitorSet:
         node.remoter.run(cmd="sudo systemctl restart docker", timeout=60)
 
         docker_hub_login(remoter=node.remoter)
+
+    @staticmethod
+    def install_node_exporter(node) -> int:
+        # The monitor's own target is its private address
+        return NodeExporterSetup().install(node, scrape_host=normalize_ipv6_url(node.private_ip_address))
 
     def download_scylla_monitoring(self, node):
         install_script = dedent(
@@ -8149,14 +8103,6 @@ class BaseMonitorSet:
                 templ_yaml = yaml.safe_load(output_file)
                 self.log.debug("Configs %s" % templ_yaml)
 
-            loader_targets_per_dc = {}
-            for loader in self.targets["loaders"].nodes:
-                if loader.region not in loader_targets_per_dc:
-                    loader_targets_per_dc[loader.region] = {"targets": [], "labels": {"dc": loader.region}}
-                loader_ip_addr = getattr(loader, self.DB_NODES_IP_ADDRESS) or ""
-                if loader_ip_addr:
-                    loader_targets_per_dc[loader.region]["targets"].append(f"{normalize_ipv6_url(loader_ip_addr)}:9100")
-
             def update_scrape_configs(base_scrape_configs, static_config_list, job_name="node_exporter"):
                 for i, scrape_config in enumerate(base_scrape_configs):
                     # NOTE: monitoring-4.7 expects that node export metrics are part of exactly the "node_export" job
@@ -8176,7 +8122,6 @@ class BaseMonitorSet:
                     )
 
             scrape_configs = templ_yaml["scrape_configs"]
-            update_scrape_configs(scrape_configs, list(loader_targets_per_dc.values()))
 
             if cloud_prom_bearer_token:
                 cloud_prom_path = self.params.get("cloud_prom_path")
@@ -8356,11 +8301,24 @@ class BaseMonitorSet:
                 targets = ",".join(targets_list)
                 scylla_targets += f"-dc {region}:{targets} "
 
+            # Loaders pick their node_exporter port while the monitors set up, so their targets are written here, where
+            # every call (and the one after setup) rewrites them, rather than once in prometheus.yml
+            loader_targets_per_dc = {}
+            for loader in getattr(self.targets.get("loaders"), "nodes", []):
+                if loader_ip_addr := getattr(loader, self.DB_NODES_IP_ADDRESS):
+                    loader_targets_per_dc.setdefault(loader.region, {"labels": {"dc": loader.region}, "targets": []})[
+                        "targets"
+                    ].append(f"{normalize_ipv6_url(loader_ip_addr)}:{loader.node_exporter_port}")
+            # With cloud Prometheus the DB targets come from there, only the loaders are scraped from here
+            cloud_prometheus = self.params.get("cloud_prom_bearer_token") or (
+                self.params.get("cluster_backend") == "xcloud" and self.promproxy_config
+            )
+
             for node in self.nodes:
                 if "monitor" not in node_export_targets_per_dc:
                     node_export_targets_per_dc["monitor"] = {"labels": {"dc": "monitor"}, "targets": []}
                 node_export_targets_per_dc["monitor"]["targets"].append(
-                    f"{normalize_ipv6_url(node.private_ip_address)}:9100"
+                    f"{normalize_ipv6_url(node.private_ip_address)}:{node.node_exporter_port}"
                 )
 
             for node in self.nodes:
@@ -8378,16 +8336,14 @@ class BaseMonitorSet:
                     f"{self.monitoring_conf_dir}/node_exporter_servers.yml", sudo=False
                 ) as exporter_yaml:
                     exporter_yaml.clear()
-                    for dc_data in node_export_targets_per_dc.values():
-                        exporter_yaml.append(dc_data)
+                    exporter_yaml.extend(loader_targets_per_dc.values())
+                    if not cloud_prometheus:
+                        exporter_yaml.extend(node_export_targets_per_dc.values())
 
-                if self.params.get("cloud_prom_bearer_token") or (
-                    self.params.get("cluster_backend") == "xcloud" and self.promproxy_config
-                ):
+                if cloud_prometheus:
                     node.remoter.run(
                         shell_script_cmd(f"""\
                         echo "targets: [] " > {self.monitoring_conf_dir}/scylla_servers.yml
-                        echo "targets: [] " > {self.monitoring_conf_dir}/node_exporter_servers.yml
                     """),
                         verbose=True,
                     )
