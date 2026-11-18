@@ -53,6 +53,7 @@ def vector_store_aws_reconfigure(cluster_of, nodes, hook, monkeypatch):
     for node in nodes:
         node.configure_vector_store_service.side_effect = lambda node=node: hook(node)
     cluster = cluster_of(VectorStoreSetAWS, nodes)
+    cluster.params = {}  # no source build: the nodes keep the vector-store of their AMI
     return lambda: VectorStoreSetAWS._reconfigure_vector_store_nodes(cluster)
 
 
