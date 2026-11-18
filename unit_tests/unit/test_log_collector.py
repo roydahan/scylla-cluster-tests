@@ -13,15 +13,20 @@
 
 import logging
 import uuid
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
+from botocore.exceptions import EndpointConnectionError
 
+from sdcm.cluster_aws import AWSNode
 from sdcm.logcollector import (
     BaseSCTLogCollector,
     Collector,
     FailureStatisticsCollector,
     GrafanaScreenShot,
+    LoaderLogCollector,
     LogCollector,
     MonitoringStack,
     PrometheusSnapshots,
@@ -319,6 +324,66 @@ def test_get_baremetal_instances_use_each_roles_ip_ssh_connections(test_id, tmp_
     assert [node.ssh_login_info["hostname"] for node in collector.loader_set] == ["192.168.2.1", "192.168.2.2"]
 
 
+def test_get_baremetal_instances_reach_lab_hosts_through_the_access_service(test_id, tmp_path_factory):
+    """Logs of a lab host come through the lab access service; a host with no public address is reached privately."""
+    test_dir = tmp_path_factory.mktemp("log-collector-baremetal-access")
+    mock_keystore = MagicMock()
+    mock_keystore.get_baremetal_config.return_value = {
+        "db_nodes": {"username": "scylla", "node_list": [{"private_ip": "10.0.0.1"}]},
+        "loader_nodes": {"username": "jenkins", "node_list": [{"private_ip": "10.0.0.60", "access": "monster"}]},
+        "monitor_nodes": {"username": "jenkins", "node_list": []},
+    }
+    params = {
+        "cluster_backend": "baremetal",
+        "use_cloud_manager": False,
+        "s3_baremetal_config": "test_baremetal_config",
+        "user_credentials_path": "~/.ssh/test_key",
+        "ip_ssh_connections": "public",
+    }
+
+    with patch("sdcm.logcollector.KeyStore", return_value=mock_keystore):
+        collector = Collector(test_id=test_id, test_dir=test_dir, params=params)
+        collector.localhost = MagicMock()
+        collector.localhost.lab_access_ssh_address.return_value = {"hostname": "172.17.0.5", "port": 10027}
+        collector.get_baremetal_instances_by_testid()
+
+    assert collector.db_cluster[0].ssh_login_info["hostname"] == "10.0.0.1"
+    # no SCT key: the access service accepts only `none` auth
+    assert collector.loader_set[0].ssh_login_info == {
+        "hostname": "172.17.0.5",
+        "port": 10027,
+        "user": "jenkins",
+        "key_file": None,
+    }
+
+
+def test_get_baremetal_instances_skip_a_lab_host_the_access_service_cant_reach(test_id, tmp_path_factory):
+    """A failed lab access lookup loses that host's logs only, not the other hosts'."""
+    test_dir = tmp_path_factory.mktemp("log-collector-baremetal-access-down")
+    mock_keystore = MagicMock()
+    mock_keystore.get_baremetal_config.return_value = {
+        "db_nodes": {"username": "scylla", "node_list": [{"private_ip": "10.0.0.1"}]},
+        "loader_nodes": {"username": "jenkins", "node_list": [{"private_ip": "10.0.0.60", "access": "monster"}]},
+        "monitor_nodes": {"username": "jenkins", "node_list": []},
+    }
+    params = {
+        "cluster_backend": "baremetal",
+        "use_cloud_manager": False,
+        "s3_baremetal_config": "test_baremetal_config",
+        "user_credentials_path": "~/.ssh/test_key",
+        "ip_ssh_connections": "private",
+    }
+
+    with patch("sdcm.logcollector.KeyStore", return_value=mock_keystore):
+        collector = Collector(test_id=test_id, test_dir=test_dir, params=params)
+        collector.localhost = MagicMock()
+        collector.localhost.lab_access_ssh_address.side_effect = RuntimeError("sdm status failed")
+        collector.get_baremetal_instances_by_testid()
+
+    assert [node.ssh_login_info["hostname"] for node in collector.db_cluster] == ["10.0.0.1"]
+    assert collector.loader_set == []
+
+
 def test_get_baremetal_instances_no_config(test_id, tmp_path_factory):
     """Test graceful handling when s3_baremetal_config is not set."""
     test_dir = tmp_path_factory.mktemp("log-collector-baremetal-noconfig")
@@ -573,3 +638,95 @@ def test_archive_log_remotely_tolerates_files_changing_while_read(exit_status, a
 
     assert archive == ("/tmp/collected/perf-data.tar.zst" if archived else None)
     assert mock_check.called == archived
+
+
+def _aws_node_with_ssh_down():
+    node = AWSNode.__new__(AWSNode)
+    node.name = "loader-node-1"
+    node._instance = Mock(id="i-028fa089cded5826b")
+    node._ec2_service = Mock()
+    node._ec2_service.meta.client.meta.region_name = "eu-west-1"
+    node.remoter = Mock(is_up=Mock(return_value=False))
+    return node
+
+
+def test_collect_log_remotely_falls_back_to_ssm_on_an_aws_node(tmp_path):
+    """SCT-1439: the in-test AWSNode had no aws_ssm_runner, so the SSM fallback raised AttributeError."""
+    node = _aws_node_with_ssh_down()
+    log_file = str(tmp_path / "node" / "system.log")
+
+    with patch("sdcm.cluster_aws.SSMCommandRunner") as ssm_runner:
+        ssm_runner.return_value.run_command_and_save_output.return_value = Mock(ok=True)
+        assert LogCollector.collect_log_remotely(node, "journalctl", log_file) == (log_file, False)
+
+    ssm_runner.assert_called_once_with(region_name="eu-west-1", instance_id="i-028fa089cded5826b")
+    ssm_runner.return_value.run_command_and_save_output.assert_called_once()
+
+
+def test_collect_log_remotely_without_ssh_or_ssm_collects_nothing(tmp_path):
+    node = SimpleNamespace(remoter=Mock(is_up=Mock(return_value=False)), aws_ssm_runner=None)
+
+    assert LogCollector.collect_log_remotely(node, "journalctl", str(tmp_path / "system.log")) == (None, True)
+
+
+def test_collect_logs_logs_the_failure_of_a_node(tmp_path, caplog):
+    """ParallelObject ignores the exceptions, so a broken node used to leave only "Directory is empty"."""
+    node = SimpleNamespace(name="loader-node-1", remoter=Mock(is_up=Mock(side_effect=RuntimeError("boom"))))
+    collector = LogCollector([node], test_id="4f7398ef", storage_dir=str(tmp_path), params=None)
+
+    assert collector.collect_logs() == []
+    assert "Failed to collect logs on host loader-node-1: RuntimeError('boom')" in caplog.text
+
+
+def test_cluster_log_type_argument_leaves_the_class_alone(tmp_path):
+    collector = ScyllaLogCollector(
+        [], test_id="4f7398ef", storage_dir=str(tmp_path), params=None, cluster_log_type="db-node-1"
+    )
+
+    assert collector.local_dir.endswith("db-node-1-4f7398ef")
+    assert ScyllaLogCollector.cluster_log_type == "db-cluster"
+
+
+def test_collect_node_logs_copies_the_local_files_of_a_node_once(tmp_path):
+    """terminate_node: collect_logs() also scanned the node dir as an inactive cluster dir, so each local file came twice."""
+    node_name = "longevity-loader-node-88976c04-1"
+    node_logdir = tmp_path / "longevity-loader-set-88976c04" / node_name
+    node_logdir.mkdir(parents=True)
+    (node_logdir / "console_output.log").write_text("[   10.42] cloud-init[408]: ...")
+    node = SimpleNamespace(name=node_name, remoter=Mock(is_up=Mock(return_value=False)), aws_ssm_runner=None)
+    collector = LoaderLogCollector([node], test_id="88976c04", storage_dir=str(tmp_path / "collected_logs"), params={})
+
+    with patch.object(LoaderLogCollector, "archive_to_tarfile", return_value=None):
+        collector.collect_node_logs(local_search_path=str(node_logdir))
+
+    collected = sorted(p.relative_to(collector.local_dir).as_posix() for p in Path(collector.local_dir).rglob("*.log"))
+    assert collected == [f"{node_name}/console_output.log"]
+
+
+def test_collect_node_logs_keeps_the_local_files_when_the_remote_dir_fails(tmp_path):
+    """SSM raises more than ClientError (e.g. EndpointConnectionError): that must not drop console_output.log."""
+    node_name = "longevity-loader-node-88976c04-1"
+    node_logdir = tmp_path / "longevity-loader-set-88976c04" / node_name
+    node_logdir.mkdir(parents=True)
+    (node_logdir / "console_output.log").write_text("[   10.42] cloud-init[408]: ...")
+    ssm_runner = Mock(run=Mock(side_effect=EndpointConnectionError(endpoint_url="https://ssm.eu-west-1.amazonaws.com")))
+    node = SimpleNamespace(name=node_name, remoter=Mock(is_up=Mock(return_value=False)), aws_ssm_runner=ssm_runner)
+    collector = LoaderLogCollector([node], test_id="88976c04", storage_dir=str(tmp_path / "collected_logs"), params={})
+
+    with patch.object(LoaderLogCollector, "archive_to_tarfile", return_value=None):
+        collector.collect_node_logs(local_search_path=str(node_logdir))
+
+    assert (Path(collector.local_dir) / node_name / "console_output.log").exists()
+
+
+def test_collect_node_logs_checks_ssh_of_a_dead_node_once(tmp_path):
+    """Each is_up() waits 30s on a node without SSH: asking once per log entity took minutes per node."""
+    node = SimpleNamespace(
+        name="longevity-loader-node-88976c04-1", remoter=Mock(is_up=Mock(return_value=False)), aws_ssm_runner=None
+    )
+    collector = LoaderLogCollector([node], test_id="88976c04", storage_dir=str(tmp_path), params={})
+
+    with patch.object(LoaderLogCollector, "archive_to_tarfile", return_value=None):
+        collector.collect_node_logs()
+
+    node.remoter.is_up.assert_called_once()

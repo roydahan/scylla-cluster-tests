@@ -28,11 +28,11 @@ concerns first, then one page per backend, then one per test type.
 
 ## Groups
 
-533 options across 29 groups.
+539 options across 29 groups.
 
 | Group | Options | What it covers |
 |---|---:|---|
-| [General and provisioning](configuration_options/general-and-provisioning.md) | 74 | Cluster topology, region/AZ placement, instance provisioning, credentials and test-level plumbing. Options here apply to every... |
+| [General and provisioning](configuration_options/general-and-provisioning.md) | 77 | Cluster topology, region/AZ placement, instance provisioning, credentials and test-level plumbing. Options here apply to every... |
 | [Scylla installation and configuration](configuration_options/scylla-installation-and-configuration.md) | 44 | Which Scylla to install and how it is configured: repos, versions, distro, `scylla.yaml`/command-line options, experimental... |
 | [Nemesis (chaos testing)](configuration_options/nemesis-chaos-testing.md) | 12 | Which disruptions run, how often, and how targets are selected. |
 | [Stress commands and load generation](configuration_options/stress-commands-and-load-generation.md) | 73 | The load applied to the cluster: stress tool command lines, loader-side settings and stress duration. **Which option belongs... |
@@ -42,7 +42,7 @@ concerns first, then one page per backend, then one per test type.
 | [Scylla Manager](configuration_options/scylla-manager.md) | 26 | Scylla Manager server and agent: versions, repos and backup/restore settings. |
 | [Auxiliary DB cluster (oracle / Cassandra)](configuration_options/auxiliary-db-cluster-oracle-cassandra.md) | 10 | A second database cluster used for comparison or migration testing -- the 'oracle' cluster in Gemini runs, or a Cassandra... |
 | [Alternator (DynamoDB API)](configuration_options/alternator-dynamodb-api.md) | 10 | Scylla's DynamoDB-compatible API: the endpoint, write isolation, load-balancing and the credentials the tests use against it. |
-| [Vector Store](configuration_options/vector-store.md) | 9 | The Vector Store service under test alongside Scylla. |
+| [Vector Store](configuration_options/vector-store.md) | 12 | The Vector Store service under test alongside Scylla. |
 | [Kafka / CDC connectors](configuration_options/kafka-cdc-connectors.md) | 2 | Kafka deployment and connector configuration for CDC testing. |
 | [AWS backend](configuration_options/aws-backend.md) | 22 | AWS-specific provisioning: AMIs, EC2 instance and disk settings, placement groups, capacity reservations and dedicated hosts. |
 | [GCE backend](configuration_options/gce-backend.md) | 24 | Google Compute Engine provisioning. |
@@ -174,6 +174,8 @@ concerns first, then one page per backend, then one per test type.
 | [`disable_raft`](configuration_options/upgrade-tests.md#disable_raft) | `SCT_DISABLE_RAFT` | [Upgrade tests](configuration_options/upgrade-tests.md) |
 | [`docker_image`](configuration_options/docker-backend.md#docker_image) | `SCT_DOCKER_IMAGE` | [Docker backend](configuration_options/docker-backend.md) |
 | [`docker_image_cassandra`](configuration_options/auxiliary-db-cluster-oracle-cassandra.md#docker_image_cassandra) | `SCT_DOCKER_IMAGE_CASSANDRA` | [Auxiliary DB cluster (oracle / Cassandra)](configuration_options/auxiliary-db-cluster-oracle-cassandra.md) |
+| [`docker_min_free_space_gb_loader`](configuration_options/general-and-provisioning.md#docker_min_free_space_gb_loader) | `SCT_DOCKER_MIN_FREE_SPACE_GB_LOADER` | [General and provisioning](configuration_options/general-and-provisioning.md) |
+| [`docker_min_free_space_gb_monitor`](configuration_options/general-and-provisioning.md#docker_min_free_space_gb_monitor) | `SCT_DOCKER_MIN_FREE_SPACE_GB_MONITOR` | [General and provisioning](configuration_options/general-and-provisioning.md) |
 | [`docker_network`](configuration_options/docker-backend.md#docker_network) | `SCT_DOCKER_NETWORK` | [Docker backend](configuration_options/docker-backend.md) |
 | [`download_from_s3`](configuration_options/monitoring-events-and-reporting.md#download_from_s3) | `SCT_DOWNLOAD_FROM_S3` | [Monitoring, events and reporting](configuration_options/monitoring-events-and-reporting.md) |
 | [`dynamodb_primarykey_type`](configuration_options/alternator-dynamodb-api.md#dynamodb_primarykey_type) | `SCT_DYNAMODB_PRIMARYKEY_TYPE` | [Alternator (DynamoDB API)](configuration_options/alternator-dynamodb-api.md) |
@@ -490,6 +492,7 @@ concerns first, then one page per backend, then one per test type.
 | [`spot_placement_score_min`](configuration_options/aws-backend.md#spot_placement_score_min) | `SCT_SPOT_PLACEMENT_SCORE_MIN` | [AWS backend](configuration_options/aws-backend.md) |
 | [`spot_score_overrides_configured_az`](configuration_options/general-and-provisioning.md#spot_score_overrides_configured_az) | `SCT_SPOT_SCORE_OVERRIDES_CONFIGURED_AZ` | [General and provisioning](configuration_options/general-and-provisioning.md) |
 | [`spot_score_region_relocation_margin`](configuration_options/aws-backend.md#spot_score_region_relocation_margin) | `SCT_SPOT_SCORE_REGION_RELOCATION_MARGIN` | [AWS backend](configuration_options/aws-backend.md) |
+| [`spot_termination_retry`](configuration_options/general-and-provisioning.md#spot_termination_retry) | `SCT_SPOT_TERMINATION_RETRY` | [General and provisioning](configuration_options/general-and-provisioning.md) |
 | [`ssh_transport`](configuration_options/general-and-provisioning.md#ssh_transport) | `SCT_SSH_TRANSPORT` | [General and provisioning](configuration_options/general-and-provisioning.md) |
 | [`sstable_file`](configuration_options/refresh-sstable-loading-tests.md#sstable_file) | `SCT_SSTABLE_FILE` | [Refresh (sstable loading) tests](configuration_options/refresh-sstable-loading-tests.md) |
 | [`sstable_md5`](configuration_options/refresh-sstable-loading-tests.md#sstable_md5) | `SCT_SSTABLE_MD5` | [Refresh (sstable loading) tests](configuration_options/refresh-sstable-loading-tests.md) |
@@ -585,6 +588,9 @@ concerns first, then one page per backend, then one per test type.
 | [`vector_store_scylla_port`](configuration_options/vector-store.md#vector_store_scylla_port) | `SCT_VECTOR_STORE_SCYLLA_PORT` | [Vector Store](configuration_options/vector-store.md) |
 | [`vector_store_scylla_username`](configuration_options/vector-store.md#vector_store_scylla_username) | `SCT_VECTOR_STORE_SCYLLA_USERNAME` | [Vector Store](configuration_options/vector-store.md) |
 | [`vector_store_service_level_shares`](configuration_options/vector-store.md#vector_store_service_level_shares) | `SCT_VECTOR_STORE_SERVICE_LEVEL_SHARES` | [Vector Store](configuration_options/vector-store.md) |
+| [`vector_store_source_build_timeout`](configuration_options/vector-store.md#vector_store_source_build_timeout) | `SCT_VECTOR_STORE_SOURCE_BUILD_TIMEOUT` | [Vector Store](configuration_options/vector-store.md) |
+| [`vector_store_source_ref`](configuration_options/vector-store.md#vector_store_source_ref) | `SCT_VECTOR_STORE_SOURCE_REF` | [Vector Store](configuration_options/vector-store.md) |
+| [`vector_store_source_repo`](configuration_options/vector-store.md#vector_store_source_repo) | `SCT_VECTOR_STORE_SOURCE_REPO` | [Vector Store](configuration_options/vector-store.md) |
 | [`vector_store_threads`](configuration_options/vector-store.md#vector_store_threads) | `SCT_VECTOR_STORE_THREADS` | [Vector Store](configuration_options/vector-store.md) |
 | [`vector_store_version`](configuration_options/vector-store.md#vector_store_version) | `SCT_VECTOR_STORE_VERSION` | [Vector Store](configuration_options/vector-store.md) |
 | [`verify_stress_after_cluster_upgrade`](configuration_options/upgrade-tests.md#verify_stress_after_cluster_upgrade) | `SCT_VERIFY_STRESS_AFTER_CLUSTER_UPGRADE` | [Upgrade tests](configuration_options/upgrade-tests.md) |

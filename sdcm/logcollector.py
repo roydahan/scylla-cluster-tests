@@ -23,6 +23,7 @@ import time
 import traceback
 import urllib.parse
 from collections import OrderedDict
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
@@ -54,6 +55,7 @@ from sdcm.remote.libssh2_client.exceptions import Failure as Libssh2_Failure
 from sdcm.sct_events.events_device import EVENTS_LOG_DIR, RAW_EVENTS_LOG
 from sdcm.test_config import TestConfig
 from sdcm.utils.aws_ssm_runner import SSMCommandRunner
+from sdcm.utils.baremetal_hosts import host_ssh_address
 from sdcm.utils.common import (
     S3Storage,
     create_remote_storage_dir,
@@ -80,6 +82,16 @@ from sdcm.utils.s3_remote_uploader import upload_remote_files_directly_to_s3
 from sdcm.xcloud.api_client import ScyllaCloudAPIClient
 
 LOGGER = logging.getLogger(__name__)
+
+# SSH state of the node whose logs this thread collects, checked once per node:
+# on a node without SSH each is_up() waits 30s, and every log entity used to ask again.
+_NODE_SSH_UP: ContextVar[bool | None] = ContextVar("node_ssh_up", default=None)
+
+
+def _node_ssh_up(node) -> bool:
+    if (ssh_up := _NODE_SSH_UP.get()) is None:
+        ssh_up = node.remoter.is_up()
+    return ssh_up
 
 
 def _create_retry_session(retries: int = 3) -> requests.Session:
@@ -660,8 +672,6 @@ class GrafanaEntity(BaseMonitoringEntity):
             # set test start time previous 6 hours
             test_start_time = time.time() - (6 * 3600)
         self.start_time = str(test_start_time).split(".", maxsplit=1)[0] + "000"
-        extra = kwargs.pop("extra_entities", [])
-        self.grafana_dashboards = self.base_grafana_dashboards + extra
         super().__init__(*args, **kwargs)
 
     def get_version(self, node):
@@ -685,7 +695,7 @@ class GrafanaScreenShot(GrafanaEntity):
     @property
     def dashboards(self) -> list:
         """The static dashboards plus any panels configured via `grafana_screenshot_panels`."""
-        return list(self.grafana_dashboards) + list(self._params.get("grafana_screenshot_panels") or [])
+        return self.base_grafana_dashboards + list(self._params.get("grafana_screenshot_panels") or [])
 
     def get_grafana_screenshot(self, node, local_dst):
         """Take a screenshot of each configured Grafana dashboard (or panel) and return local paths."""
@@ -803,9 +813,11 @@ class LogCollector:
     def current_run(self):
         return LogCollector._current_run
 
-    def __init__(self, nodes, test_id, storage_dir, params):
+    def __init__(self, nodes, test_id, storage_dir, params, cluster_log_type: str | None = None):
         self.test_id = test_id
         self.nodes = nodes
+        if cluster_log_type:
+            self.cluster_log_type = cluster_log_type
         self.local_dir = self.create_local_storage_dir(storage_dir)
         self.params = params
         for entity in self.log_entities:
@@ -827,7 +839,7 @@ class LogCollector:
             path = node.name
         remote_dir = os.path.join(self.node_remote_dir, path)
 
-        if ssh_connected := node.remoter.is_up():
+        if ssh_connected := _node_ssh_up(node):
             try:
                 result = node.remoter.run(f"mkdir -p {remote_dir}", ignore_status=True)
 
@@ -842,10 +854,12 @@ class LogCollector:
                 ssm_result = ssm_runner.run(f"mkdir -p {remote_dir}", ignore_status=True)
                 ok = ssm_result.ok
                 if not ok:
-                    LOGGER.error("SSM command failed for instance %s: mkdir", node._instance.get("InstanceId"))
+                    LOGGER.error("SSM command failed for instance %s: mkdir", ssm_runner.instance_id)
 
-            except (ClientError, AttributeError) as e:
-                LOGGER.error("Failed to run SSM command: %s", e)
+            # Not only ClientError: botocore raises e.g. EndpointConnectionError, and an error here
+            # would stop the whole node collection, before the local files like console_output.log
+            except Exception as e:  # noqa: BLE001
+                LOGGER.error("Failed to run SSM command: %r", e)
                 remote_dir = self.node_remote_dir
         else:
             remote_dir = self.node_remote_dir
@@ -858,8 +872,9 @@ class LogCollector:
             return None, False
 
         is_file_remote = True
+        ok = False
 
-        if ssh_connected := node.remoter.is_up():
+        if ssh_connected := _node_ssh_up(node):
             try:
                 collect_log_command = f"{cmd} > '{log_filename}' 2>&1"
                 node.remoter.run(collect_log_command, ignore_status=True, verbose=True)
@@ -886,11 +901,9 @@ class LogCollector:
                 )
                 ok = ssm_result.ok
                 if not ssm_result.ok:
-                    LOGGER.error(
-                        "SSM command failed for instance %s: %s ", node._instance.get("InstanceId"), collect_log_command
-                    )
+                    LOGGER.error("SSM command failed for instance %s: %s ", ssm_runner.instance_id, collect_log_command)
                     return None, is_file_remote
-            except (ImportError, AttributeError, TypeError, ValueError, KeyError, IndexError) as e:
+            except (ClientError, ImportError, AttributeError, TypeError, ValueError, KeyError, IndexError) as e:
                 LOGGER.error("Failed to run SSM command: %s", e)
                 return None, is_file_remote
         return log_filename if ok else None, is_file_remote
@@ -942,23 +955,36 @@ class LogCollector:
         return local_dir
 
     def collect_logs(self, local_search_path: Optional[str] = None) -> list[str]:
+        return self.collect_node_logs(local_search_path)
+
+    def collect_node_logs(self, local_search_path: Optional[str] = None) -> list[str]:
+        """Collect the logs of `self.nodes` only, without the subclasses' scan for inactive nodes."""
+
         def collect_logs_per_node(node):
             LOGGER.info("Collecting logs on host: %s", node.name)
-            remote_node_dir = self.create_remote_storage_dir(node)
-            local_node_dir = os.path.join(self.local_dir, node.name)
-            local_parent_dir = self.local_dir
-            for log_entity in self.log_entities:
-                try:
-                    log_entity.collect(
-                        node=node,
-                        local_dst=local_parent_dir if log_entity.collect_from_parent else local_node_dir,
-                        remote_dst=remote_node_dir,
-                        local_search_path=local_search_path,
-                    )
-                except Exception as details:  # noqa: BLE001
-                    LOGGER.error(
-                        "Error occured during collecting of %s on host: %s\n%s", log_entity.name, node.name, details
-                    )
+            # Set in the worker thread, so each node keeps its own answer
+            ssh_up_token = _NODE_SSH_UP.set(bool(node.remoter and node.remoter.is_up()))
+            try:
+                remote_node_dir = self.create_remote_storage_dir(node)
+                local_node_dir = os.path.join(self.local_dir, node.name)
+                local_parent_dir = self.local_dir
+                for log_entity in self.log_entities:
+                    try:
+                        log_entity.collect(
+                            node=node,
+                            local_dst=local_parent_dir if log_entity.collect_from_parent else local_node_dir,
+                            remote_dst=remote_node_dir,
+                            local_search_path=local_search_path,
+                        )
+                    except Exception as details:  # noqa: BLE001
+                        LOGGER.error(
+                            "Error occured during collecting of %s on host: %s\n%s",
+                            log_entity.name,
+                            node.name,
+                            details,
+                        )
+            finally:
+                _NODE_SSH_UP.reset(ssh_up_token)
 
         LOGGER.debug("Nodes list %s", [node.name for node in self.nodes])
 
@@ -968,9 +994,12 @@ class LogCollector:
         if workers_number := len(self.nodes):
             workers_number = min(workers_number, 30)
             try:
-                ParallelObject(self.nodes, num_workers=workers_number, timeout=self.collect_timeout).run(
+                results = ParallelObject(self.nodes, num_workers=workers_number, timeout=self.collect_timeout).run(
                     collect_logs_per_node, ignore_exceptions=True
                 )
+                for result in results:
+                    if result.exc:
+                        LOGGER.error("Failed to collect logs on host %s: %r", result.obj.name, result.exc)
             except Exception as details:  # noqa: BLE001
                 LOGGER.error("Error occured during collecting logs %s", details)
 
@@ -1033,6 +1062,11 @@ class LogCollector:
             return None
 
 
+def cat_scylla_conf(path: str) -> str:
+    """`cat` a Scylla config file, falling back to the nonroot offline-install copy under ~/scylladb."""
+    return f"{{ cat {path} 2>/dev/null || cat ~/scylladb{path}; }}"
+
+
 class ScyllaLogCollector(LogCollector):
     """ScyllaDB cluster log collecting
 
@@ -1068,13 +1102,9 @@ class ScyllaLogCollector(LogCollector):
         CommandLog(name="mem_info", command="cat /proc/meminfo"),
         CommandLog(name="interrupts", command="cat /proc/interrupts"),
         CommandLog(name="vmstat", command="cat /proc/vmstat"),
-        CommandLog(
-            name="scylla.yaml",
-            # Fixme: command=f'cat {self.add_install_prefix(SCYLLA_YAML_PATH)}'),
-            command=f"cat {SCYLLA_YAML_PATH}",
-        ),
+        CommandLog(name="scylla.yaml", command=cat_scylla_conf(SCYLLA_YAML_PATH)),
         CommandLog(name="coredumps.info", command="sudo coredumpctl info"),
-        CommandLog(name="io-properties.yaml", command="cat /etc/scylla.d/io_properties.yaml"),
+        CommandLog(name="io-properties.yaml", command=cat_scylla_conf("/etc/scylla.d/io_properties.yaml")),
         CommandLog(name="dmesg.log", command="sudo dmesg -P"),
         # a node which is up locally but unreachable for its peers and loaders (SCT-479) can
         # only be diagnosed with the netfilter rules and the routing state of the node at hand
@@ -1107,7 +1137,7 @@ class ScyllaLogCollector(LogCollector):
                 "sudo vector validate /etc/vector/vector.yaml )"
             ),
         ),
-        CommandLog(name="cassandra-rackdc.properties", command=f"cat {SCYLLA_PROPERTIES_PATH}"),
+        CommandLog(name="cassandra-rackdc.properties", command=cat_scylla_conf(SCYLLA_PROPERTIES_PATH)),
         CommandLog(name="scylla-manager-agent.yaml", command=f"cat {SCYLLA_MANAGER_AGENT_YAML_PATH}"),
         CommandLog(
             name="scylla-manager-agent.log",
@@ -2297,20 +2327,22 @@ class Collector:
             ip_type = node_config.get("ip_ssh_connections") or run_ip_type
 
             for idx, node_info in enumerate(node_list):
-                public_ip = node_info.get("public_ip")
                 private_ip = node_info.get("private_ip")
-                hostname = public_ip if ip_type == "public" else private_ip
-
-                if not hostname:
-                    LOGGER.warning("No %s IP found for baremetal node %s-%d, skipping", ip_type, config_key, idx)
+                public_ip = node_info.get("public_ip", private_ip)
+                # `private_ip` is required in the hosts config (`NodeInfo`): the run itself can't start without it, so
+                # a host with only a public address took no part in the run and has no logs to collect
+                if not private_ip and not node_info.get("access"):
+                    LOGGER.warning("No address found for baremetal node %s-%d, skipping", config_key, idx)
                     continue
 
                 node_name = f"{node_tag}-node-{self.test_id[:8]}-{idx}"
-                ssh_login_info = {
-                    "hostname": hostname,
-                    "user": ssh_username,
-                    "key_file": user_credentials_path,
-                }
+                ssh_login_info = {"user": ssh_username, "key_file": user_credentials_path}
+                try:
+                    ssh_login_info |= host_ssh_address(node_info, ip_type, self.localhost)
+                except Exception as exc:  # noqa: BLE001
+                    # A lab access lookup that fails loses this host's logs only, not the other hosts'
+                    LOGGER.warning("Can't reach baremetal node %s-%d, skipping: %s", config_key, idx, exc)
+                    continue
 
                 collecting_node = CollectingNode(
                     name=node_name,
@@ -2319,6 +2351,8 @@ class Collector:
                     global_ip=public_ip or private_ip,
                     tags={
                         **self.tags,
+                        # The monitor's install directory is named after the run (MonitorSetPhysical)
+                        "TestId": self.test_id,
                         "NodeType": node_tag,
                     },
                 )

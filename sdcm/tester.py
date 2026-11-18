@@ -132,7 +132,12 @@ from sdcm.provision.helpers.certificate import (
 )
 from sdcm.provision.network_configuration import ssh_connection_ip_type
 from sdcm.provision.oci.provisioner import OciProvisioner
-from sdcm.provision.provisioner import ProvisionError, ProvisionUnrecoverableError, provisioner_factory
+from sdcm.provision.provisioner import (
+    OperationPreemptedError,
+    ProvisionError,
+    ProvisionUnrecoverableError,
+    provisioner_factory,
+)
 from sdcm.remote import LOCALRUNNER, RemoteCmdRunnerBase
 from sdcm.reporting.tooling_reporter import PythonDriverReporter
 from sdcm.scan_operation_thread import ScanOperationThread
@@ -147,7 +152,13 @@ from sdcm.sct_events.setup import (
     start_events_device,
     stop_events_device,
 )
-from sdcm.sct_events.system import InfoEvent, TestFrameworkEvent, TestResultEvent, TestTimeoutEvent
+from sdcm.sct_events.system import (
+    InfoEvent,
+    SpotTerminationEvent,
+    TestFrameworkEvent,
+    TestResultEvent,
+    TestTimeoutEvent,
+)
 from sdcm.scylla_bench_thread import ScyllaBenchThread
 from sdcm.spark_migrator import build_spark4_bootstrap_actions
 from sdcm.stress.latte_thread import LatteStressThread
@@ -265,6 +276,15 @@ PERF_COLLECTOR_SERVICE = "scylla-perf-collector"
 PYTHON_THREAD_LIST = (KafkaCDCReaderThread, KafkaProducerThread, KafkaValidatorThread)
 
 
+def _chained_preemption(exc: BaseException | None) -> OperationPreemptedError | None:
+    """The OperationPreemptedError in *exc*'s cause/context chain, if any."""
+    while exc is not None:
+        if isinstance(exc, OperationPreemptedError):
+            return exc
+        exc = exc.__cause__ or exc.__context__
+    return None
+
+
 def teardown_on_exception(method):
     """
     Ensure that resources used in test are cleaned upon unhandled exceptions. and every process are stopped, and logs
@@ -293,6 +313,10 @@ def teardown_on_exception(method):
                 exception=exc,
                 severity=severity,
             ).publish_or_dump()
+            # A spot preemption that reached setUp is final - the on-demand fallback already had its chance - so
+            # report it as one: `spot-retry-decision` only reads SpotTerminationEvent (SCT-707).
+            if preemption := _chained_preemption(exc):
+                SpotTerminationEvent(node="provisioning", message=str(preemption)).publish_or_dump()
             TEST_LOG.exception("Exception in %s. Will call tearDown", method.__name__)
             # Try to initialize Argus if it hasn't been done yet, so the failure
             # is reported with proper TEST_ERROR status.
@@ -1043,6 +1067,24 @@ class ClusterTester(unittest.TestCase):
         if summary.get("ERROR", 0) or summary.get("CRITICAL", 0):
             return "FAILED"
         return "SUCCESS"
+
+    @contextlib.contextmanager
+    def subTest(self, *args, **params):
+        """`unittest.TestCase.subTest` that lets a critical failure end the test.
+
+        unittest records any exception of a subtest as that subtest's failure and goes on with the next one, so
+        `kill_test` (a spot reclaim, the test duration running out) would only fail one subtest, and the rest
+        would run against dead nodes until the job timeout. The failure is still recorded on the subtest.
+        """
+        critical = None
+        with super().subTest(*args, **params):
+            try:
+                yield
+            except CriticalTestFailure as exc:
+                critical = exc
+                raise
+        if critical:
+            raise critical
 
     def kill_test(self, backtrace_with_reason):
         test_pid = os.getpid()
@@ -2371,34 +2413,29 @@ class ClusterTester(unittest.TestCase):
         )
         user_credentials = self.params.get("user_credentials_path")
         self.credentials.append(UserRemoteCredentials(key_file=user_credentials))
-        params = dict(
-            n_nodes=len(baremetal_info["db_nodes"]["node_list"]),
-            public_ips=[n["public_ip"] for n in baremetal_info["db_nodes"]["node_list"]],
-            private_ips=[n["private_ip"] for n in baremetal_info["db_nodes"]["node_list"]],
+
+        def role(section: str) -> dict:
+            hosts = baremetal_info[section]
+            return dict(
+                n_nodes=len(hosts["node_list"]),
+                # a lab host often has its private address only
+                public_ips=[host.get("public_ip", host["private_ip"]) for host in hosts["node_list"]],
+                private_ips=[host["private_ip"] for host in hosts["node_list"]],
+                access_names=[host.get("access") for host in hosts["node_list"]],
+                ssh_username=hosts["username"],
+                ip_ssh_connections=hosts.get("ip_ssh_connections"),
+            )
+
+        common = dict(
             user_prefix=self.params.get("user_prefix"),
             credentials=self.credentials,
-            ssh_username=baremetal_info["db_nodes"]["username"],
-            ip_ssh_connections=baremetal_info["db_nodes"].get("ip_ssh_connections"),
             params=self.params,
             region_names=["dummy_region"],
         )
-        self.db_cluster = cluster_baremetal.ScyllaPhysicalCluster(**params)
-
-        params["n_nodes"] = len(baremetal_info["loader_nodes"]["node_list"])
-        params["public_ips"] = [n["public_ip"] for n in baremetal_info["loader_nodes"]["node_list"]]
-        params["private_ips"] = [n["private_ip"] for n in baremetal_info["loader_nodes"]["node_list"]]
-        params["ssh_username"] = baremetal_info["loader_nodes"]["username"]
-        params["ip_ssh_connections"] = baremetal_info["loader_nodes"].get("ip_ssh_connections")
-        self.loaders = cluster_baremetal.LoaderSetPhysical(**params)
-
-        params["n_nodes"] = len(baremetal_info["monitor_nodes"]["node_list"])
-        params["public_ips"] = [n["public_ip"] for n in baremetal_info["monitor_nodes"]["node_list"]]
-        params["private_ips"] = [n["private_ip"] for n in baremetal_info["monitor_nodes"]["node_list"]]
-        params["ssh_username"] = baremetal_info["monitor_nodes"]["username"]
-        params["ip_ssh_connections"] = baremetal_info["monitor_nodes"].get("ip_ssh_connections")
+        self.db_cluster = cluster_baremetal.ScyllaPhysicalCluster(**common, **role("db_nodes"))
+        self.loaders = cluster_baremetal.LoaderSetPhysical(**common, **role("loader_nodes"))
         self.monitors = cluster_baremetal.MonitorSetPhysical(
-            **params,
-            targets=dict(db_cluster=self.db_cluster, loaders=self.loaders),
+            **common, **role("monitor_nodes"), targets=dict(db_cluster=self.db_cluster, loaders=self.loaders)
         )
 
     def get_cluster_k8s_local_kind_cluster(self):
@@ -3265,6 +3302,8 @@ class ClusterTester(unittest.TestCase):
         stop_test_on_failure=True,
         node_list=None,
         extra_files_to_stage=None,
+        record_hdr=True,
+        loader=None,
         **_,
     ):
         if duration:
@@ -3287,6 +3326,8 @@ class ClusterTester(unittest.TestCase):
             stop_test_on_failure=stop_test_on_failure,
             params=self.params,
             extra_files_to_stage=extra_files_to_stage,
+            record_hdr=record_hdr,
+            loader=loader,
         ).run()
 
     def run_hydra_kcl_thread(
@@ -4301,7 +4342,7 @@ class ClusterTester(unittest.TestCase):
         action, doing = ("start", "starting") if running else ("stop", "stopping")
 
         def on_node(node):
-            if node.is_kubernetes() or node.is_docker() or not node.ssh_login_info:
+            if node.is_kubernetes() or node.is_docker() or not node.ssh_login_info or node.spot_reclaimed:
                 self.log.debug("%s: no systemd access, skipping %s", node.name, PERF_COLLECTOR_SERVICE)
                 return
             try:

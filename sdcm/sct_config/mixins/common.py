@@ -142,6 +142,16 @@ class CommonConfigMixin(BaseModel):
          In case of random option - Scylla will start with different (random) shards on every node of the cluster
          """,
     )
+    docker_min_free_space_gb_loader: int = SctField(
+        description="""Free space, in GB, the Docker image store of a loader host needs before the run pulls the stress
+         tool images. Setup first removes images no container uses, then fails if the space is still short.
+         A host that is both loader and monitor needs the sum. 0 turns the check off.""",
+    )
+    docker_min_free_space_gb_monitor: int = SctField(
+        description="""Free space, in GB, the Docker image store of a monitor host needs before the run pulls the
+         monitoring stack images. Setup first removes images no container uses, then fails if the space is still short.
+         A host that is both loader and monitor needs the sum. 0 turns the check off.""",
+    )
     fallback_to_next_availability_zone: Boolean = SctField(
         description="On capacity errors, automatically retry provisioning in the next available AZ in the same region. "
         "Backend-agnostic parameter; supersedes `aws_fallback_to_next_availability_zone`. "
@@ -330,6 +340,14 @@ class CommonConfigMixin(BaseModel):
         description="Duration (min) up to which `instance_provision` defaults to spot; longer tests default to on_demand, "
         "since interruption exposure grows with runtime. Only applies when `instance_provision` was not set "
         "explicitly by a test case, env var or CLI - an explicit value always wins.",
+    )
+    spot_termination_retry: StringOrList = SctField(
+        description="Re-run the test inside the same Jenkins build when an attempt is lost to a spot reclaim. "
+        "One `instance_provision` value per retry, e.g. `[spot, on_demand]`: at most 2 entries, and the last "
+        "must be `on_demand`, so a retrying test always ends on an attempt that cannot be reclaimed. Empty "
+        "(the default) means no retry. Read by `sct.py spot-retry-decision`; only pipelines that call "
+        "`runWithSpotRetry` act on it.",
+        appendable=False,
     )
     ssh_transport: Literal["libssh2", "fabric"] = SctField(
         description="""Set type of ssh library to use. Could be 'libssh2' (default) or 'fabric'""",

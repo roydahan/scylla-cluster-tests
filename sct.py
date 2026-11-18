@@ -79,6 +79,7 @@ lazy from sdcm.sct_runner import (
     update_sct_runner_tags,
 )
 lazy from sdcm.test_config import TestConfig
+lazy from sdcm.utils import spot_retry
 lazy from sdcm.utils.argus import (
     ReplayOnlyArgusSCTClient,
     create_proxy_argus_s3_url,
@@ -92,6 +93,7 @@ lazy from sdcm.utils.aws_peering import AwsVpcPeering
 lazy from sdcm.utils.aws_region import AwsRegion
 lazy from sdcm.utils.aws_utils import AwsArchType, get_arch_from_instance_type
 lazy from sdcm.utils.azure_region import AzureRegion
+lazy from sdcm.utils.builder_access import get_builder_ssh_sources
 lazy from sdcm.utils.ci_tools import get_job_name, get_job_url
 lazy from sdcm.utils.cloud_catalog.cost import RunCostEstimate, estimate_run_cost
 lazy from sdcm.utils.cloud_monitor import cloud_qa_report, cloud_report
@@ -3103,6 +3105,8 @@ def configure_jenkins_throttle(username, password, dry_run, suffix):
 def prepare_regions(cloud_provider, regions):
     add_file_logger()
     regions = regions or get_all_regions(cloud_provider)
+    if cloud_provider in ("aws", "gce", "oci") and not is_minicloud_active():
+        get_builder_ssh_sources()
 
     for region in regions:
         if cloud_provider == "aws":
@@ -3384,11 +3388,15 @@ def clean_runner_instances(runner_ip, test_status, backend, user, billing_projec
 def configure_jenkins_builders(cloud_provider, regions):
     add_file_logger()
     logging.basicConfig(level=logging.INFO)
+    if cloud_provider in ("aws", "gce", "oci"):
+        get_builder_ssh_sources()
 
     match cloud_provider:
         case "aws":
-            AwsCiBuilder(AwsRegion("eu-west-1")).configure_auto_scaling_group()
-            AwsFipsCiBuilder(AwsRegion("us-east-1")).configure_auto_scaling_group()
+            if not regions or "eu-west-1" in regions:
+                AwsCiBuilder(AwsRegion("eu-west-1")).configure_auto_scaling_group()
+            if not regions or "us-east-1" in regions:
+                AwsFipsCiBuilder(AwsRegion("us-east-1")).configure_auto_scaling_group()
             AwsBuilder.configure_in_all_region(regions=regions)
         case "gce":
             GceBuilder.configure_in_all_region(regions=regions)
@@ -3487,6 +3495,36 @@ def create_argus_test_run():
             LOGGER.info("Initialized Argus TestRun with test id %s", argus_client.run_id)
     except ArgusClientError:
         LOGGER.error("Failed to submit data to Argus", exc_info=True)
+
+
+@cli.command("spot-retry-decision", help="Decide whether a failed attempt lost to a spot reclaim is retried.")
+@click.option("--attempt", type=int, required=True, help="1-based number of the attempt that just failed")
+def spot_retry_decision(attempt):
+    """Print `SPOT_RETRY_DECISION=<stop|spot|on_demand>` for the run in SCT_TEST_ID.
+
+    Any error answers `stop`: a retry must never happen without evidence of a reclaim.
+    """
+    add_file_logger()
+    decision = spot_retry.STOP
+    try:
+        params = SCTConfiguration()
+        policy = params.get("spot_termination_retry") or []
+        if policy and params.get("test_id"):
+            test_config = get_test_config()
+            test_config.set_test_id_only(params.get("test_id"))
+            test_config.init_argus_client(params)
+            argus_client = test_config.argus_client()
+            if isinstance(argus_client, ReplayOnlyArgusSCTClient):
+                LOGGER.warning("Argus is not reachable from here (replay-only client), cannot see the run's events")
+            else:
+                next_provision = spot_retry.decide(policy, attempt, spot_retry.fetch_run_events(argus_client))
+                if next_provision != spot_retry.STOP:
+                    argus_client.set_sct_run_status(spot_retry.RETRIED_RUN_STATUS)
+                decision = next_provision
+    except Exception:  # noqa: BLE001
+        LOGGER.error("Could not decide on a spot retry, not retrying", exc_info=True)
+    LOGGER.info("Spot retry decision after attempt %s: %s", attempt, decision)
+    click.echo(f"{spot_retry.DECISION_MARKER}{decision}")
 
 
 @cli.command("finish-argus-test-run", help="Finish argus test run if it is not finished by SCT.")

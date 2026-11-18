@@ -30,12 +30,15 @@ Available skills (invoke via Skill tool or `/skill-name`):
 - `commit-summary` — Generate weekly commit summary reports
 - `writing-nemesis` — Create new chaos engineering disruptions
 - `code-review` — Review PRs for correctness and convention compliance
+- `running-ai-reviewers` — Run Claude or CodeRabbit locally with the `REVIEW.md` rules
 - `discovering-standards` — Discover the coding standards, write `docs/standards/` and `docs/INDEX.md`, and update `REVIEW.md`
 - `updating-standards` — Add or change one coding standard
 - `labeling-pipelines` — Add test_metadata to test-case YAML files
 - `reviewing-pipeline-docs` — Review test_metadata sections for accuracy
 - `stack-sync` — Manage stacked PRs via the gh-stack CLI extension (native GitHub stacked PR support)
 - `downscaling-for-minicloud` — Shrink a test-case to run against the local minicloud emulator
+- `running-staging-jobs` — Prove a PR on staging Jenkins with per-PR copies of the affected pipelines
+- `updating-runner-images` — Roll out a new SCT runner image and move the Jenkins builders onto it
 
 ## Development flow
 

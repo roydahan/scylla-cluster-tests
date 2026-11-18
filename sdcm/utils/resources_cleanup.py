@@ -30,6 +30,7 @@ from mypy_boto3_ec2 import EC2Client
 
 from sdcm.cluster_baremetal import PhysicalHost
 from sdcm.keystore import KeyStore
+from sdcm.localhost import LocalHost
 from sdcm.provision.aws.capacity_reservation import SCTCapacityReservation
 from sdcm.provision.aws.dedicated_host import SCTDedicatedHosts
 from sdcm.provision.aws.emr_provisioner import list_emr_clusters
@@ -46,6 +47,7 @@ from sdcm.utils.argus import (
 )
 from sdcm.utils.aws_kms import AwsKms
 from sdcm.utils.aws_region import AwsRegion
+from sdcm.utils.baremetal_hosts import host_ssh_address
 from sdcm.utils.common import (
     all_aws_regions,
     aws_tags_to_dict,
@@ -240,9 +242,10 @@ def clean_resources_baremetal(tags_dict: dict, config, dry_run: bool = False) ->
     SCT neither creates nor destroys physical hosts, so cleaning them up means undoing what the run left on them that
     breaks the next one: the SSH tunnel ports it bound on the roles with `ip_ssh_connections: public` (the role's own
     setting in the hosts config, else the run's), and the Scylla install of a DB host (its disk setup and the files it
-    left), unless Scylla came preinstalled. Every host also gets back the packages it had before the run. Runs in the
-    cleanup phase, after the logs were collected, for the node types the post behavior asks to clean (`NodeType`, all
-    of them when not given).
+    left), unless Scylla came preinstalled. A DB host also gets back the packages it had before the run; loader and
+    monitor hosts are shared with other jobs and keep theirs. A monitor host loses the run's monitoring stack and its
+    directory. Runs in the cleanup phase, after the logs were collected, for the node types the post behavior asks to
+    clean (`NodeType`, all of them when not given).
     """
     node_types = tags_dict.get("NodeType")
     node_types = list(BAREMETAL_HOSTS_SECTIONS) if node_types is None else node_types
@@ -261,30 +264,59 @@ def clean_resources_baremetal(tags_dict: dict, config, dry_run: bool = False) ->
         # The run's tunnel containers go first: one left running would reconnect and bind its port on the host again
         clean_resources_docker(tags_dict, dry_run=dry_run)
 
-    for node_type, section in sections.items():
-        tunnel_ports = node_type in public_roles
-        scylla_disk_setup = node_type == "scylla-db" and not config.get("use_preinstalled_scylla")
-        for host_ips in section["node_list"]:
-            address = host_ips["public_ip"] if tunnel_ports else host_ips["private_ip"]
-            if dry_run:
-                LOGGER.info(
-                    "Would clean up %s host %s (tunnel ports: %s, scylla install: %s, packages: yes)",
-                    node_type,
-                    address,
-                    tunnel_ports,
-                    scylla_disk_setup,
+    # Hosts named in the lab access service are reached through it, the way the run reached them
+    lab_access = not dry_run and any(
+        host.get("access") for section in sections.values() for host in section["node_list"]
+    )
+    localhost = (
+        LocalHost(user_prefix=config.get("user_prefix"), test_id=tags_dict.get("TestId")) if lab_access else None
+    )
+    try:
+        for node_type, section in sections.items():
+            role_tunnel_ports = node_type in public_roles
+            scylla_disk_setup = node_type == "scylla-db" and not config.get("use_preinstalled_scylla")
+            # Loader and monitor hosts are shared with other jobs: their packages stay as they are
+            restore_baseline = node_type == "scylla-db"
+            monitoring_stack_of = tags_dict.get("TestId") if node_type == "monitor" else None
+            for host in section["node_list"]:
+                # A host reached through the lab access service never gets tunnels, see PhysicalMachineNode
+                tunnel_ports = role_tunnel_ports and not host.get("access")
+                name = host.get("access") or (
+                    host.get("public_ip", host["private_ip"]) if tunnel_ports else host["private_ip"]
                 )
-                continue
-            LOGGER.info("Cleaning up %s host %s", node_type, address)
-            remoter = RemoteCmdRunnerBase.create_remoter(
-                hostname=address, user=section["username"], key_file=config.get("user_credentials_path")
-            )
-            try:
-                PhysicalHost(name=f"{node_type} {address}", remoter=remoter).clean_up_host(
-                    tunnel_ports=tunnel_ports, scylla_disk_setup=scylla_disk_setup
-                )
-            finally:
-                remoter.stop()
+                if dry_run:
+                    LOGGER.info(
+                        "Would clean up %s host %s (tunnel ports: %s, scylla install: %s, packages: %s, "
+                        "monitoring stack: %s)",
+                        node_type,
+                        name,
+                        tunnel_ports,
+                        scylla_disk_setup,
+                        restore_baseline,
+                        monitoring_stack_of or False,
+                    )
+                    continue
+                LOGGER.info("Cleaning up %s host %s", node_type, name)
+                ssh_login_info = {"user": section["username"], "key_file": config.get("user_credentials_path")}
+                try:
+                    ssh_login_info |= host_ssh_address(host, "public" if tunnel_ports else "private", localhost)
+                except Exception as exc:  # noqa: BLE001
+                    # As in clean_up_host: one host that can't be reached must not keep the others dirty
+                    LOGGER.warning("Can't reach %s host %s, not cleaning it up: %s", node_type, name, exc)
+                    continue
+                remoter = RemoteCmdRunnerBase.create_remoter(**ssh_login_info)
+                try:
+                    PhysicalHost(name=f"{node_type} {name}", remoter=remoter).clean_up_host(
+                        tunnel_ports=tunnel_ports,
+                        scylla_disk_setup=scylla_disk_setup,
+                        restore_baseline=restore_baseline,
+                        monitoring_stack_of=monitoring_stack_of,
+                    )
+                finally:
+                    remoter.stop()
+    finally:
+        if localhost:
+            localhost.destroy()
 
 
 def clean_resources_docker(tags_dict: dict, dry_run: bool = False) -> None:

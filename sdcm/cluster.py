@@ -37,7 +37,7 @@ from collections import Counter, defaultdict
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import ROUND_UP, Decimal
 from functools import cached_property, lru_cache, partial, wraps
@@ -77,6 +77,8 @@ from sdcm.keystore import KeyStore
 from sdcm.log import SDCMAdapter
 from sdcm.logcollector import (
     GrafanaScreenShot,
+    LoaderLogCollector,
+    MonitorLogCollector,
     PrometheusSnapshots,
     ScyllaLogCollector,
     collect_diagnostic_data,
@@ -85,7 +87,6 @@ from sdcm.logcollector import (
 )
 from sdcm.mgmt import AnyManagerCluster, ScyllaManagerError
 from sdcm.mgmt.common import get_manager_repo, get_manager_scylla_backend
-from sdcm.monitorstack.ui import AlternatorDashboard, GeminiDashboard
 from sdcm.node_exporter_setup import NODE_EXPORTER_DEFAULT_PORT, NodeExporterSetup
 from sdcm.paths import (
     SCYLLA_MANAGER_AGENT_YAML_PATH,
@@ -153,7 +154,13 @@ from sdcm.sct_events.filters import EventsSeverityChangerFilter
 from sdcm.sct_events.grafana import set_grafana_url
 from sdcm.sct_events.health import ClusterHealthValidatorEvent
 from sdcm.sct_events.nodetool import NodetoolEvent
-from sdcm.sct_events.system import INSTANCE_STATUS_EVENTS_PATTERNS, AwsKmsEvent, InfoEvent, TestFrameworkEvent
+from sdcm.sct_events.system import (
+    INSTANCE_STATUS_EVENTS_PATTERNS,
+    AwsKmsEvent,
+    InfoEvent,
+    SpotTerminationEvent,
+    TestFrameworkEvent,
+)
 from sdcm.sct_provision.aws.user_data import ScyllaUserDataBuilder
 from sdcm.snitch_configuration import SnitchConfig
 from sdcm.test_config import TestConfig
@@ -242,6 +249,14 @@ from sdcm.wait import wait_for_log_lines
 # are supposed to run longer than 24 hours from being killed
 SCYLLA_DIR = "/var/lib/scylla"
 
+# Key files Releng publishes next to the repos (scylla-pkg create_repo.py and the RPM .repo files
+# use the same URLs). fetch_apt_keys() tries these before any public keyserver.
+# Not mapped: downloads/gpg/scylladb-2024.gpg (491C93B9DE7496A7) is a stale copy that expired 2026-01-31.
+SCYLLA_APT_KEY_URLS = {
+    "A43E06657BAC99E3": "https://downloads.scylladb.com/downloads/gpg/scylladb-2024-rsa.gpg",
+    "C503C686B007F39E": "https://downloads.scylladb.com/downloads/gpg/scylladb-2026-rsa.gpg",
+}
+
 DB_LOG_PATTERN_RESHARDING_START = "(?i)database - Resharding"
 DB_LOG_PATTERN_RESHARDING_FINISH = "(?i)storage_service - Restarting a node in NORMAL"
 
@@ -266,6 +281,89 @@ FIREWALL_RULE_DUMP_COMMANDS = ("iptables-save", "ip6tables-save", "nft list rule
 
 # how `ss` prints a listener bound to every address of the node, per address family
 CQL_WILDCARD_ADDRESSES = frozenset({"0.0.0.0", "*", "::"})
+
+# Tools the monitoring stack's scripts need on the monitor host, installed only when missing
+MONITOR_PREREQ_PACKAGES = ("curl", "unzip", "python3", "python3-pip")
+
+# Prints what the monitor host lacks: package names from MONITOR_PREREQ_PACKAGES, `python-libs` when the
+# scylla-monitoring scripts can't import their modules, `docker-group` when only root can use Docker and
+# `docker` when Docker doesn't work at all
+MONITOR_PREREQS_PROBE = """
+    for tool in curl unzip python3; do command -v $tool > /dev/null || echo $tool; done
+    if ! python3 -c "import yaml, psutil" 2> /dev/null; then
+        echo python-libs
+        command -v pip3 > /dev/null || echo python3-pip
+    fi
+    if ! docker info > /dev/null 2>&1; then
+        if sudo -n docker info > /dev/null 2>&1; then echo docker-group; else echo docker; fi
+    fi
+"""
+
+# Oldest Docker Engine SCT accepts on loaders and monitors, whatever its packaging (docker-ce, moby-engine,
+# docker.io). 20.10 is the oldest line still shipped by the supported distros.
+DOCKER_MIN_VERSION = (20, 10)
+DOCKER_UNUSABLE = (
+    "Docker is not running, or the SSH user can't use it, and SCT doesn't install or change Docker on this host: "
+    "install and start Docker, and add the user to the `docker` group"
+)
+
+MONITOR_PYTHON_LIBS_INSTALL_SCRIPT = """
+    # PEP 668 distros refuse system-wide pip installs unless asked to
+    if pip3 install --help | grep -q break-system-packages; then
+        PIP_ARGS=--break-system-packages
+    fi
+    pip3 install $PIP_ARGS pyyaml psutil
+"""
+
+DOCKER_INSTALL_SCRIPT = f"""
+    install_docker() {{
+        local max_retries=3
+        local attempt=0
+        while [ $attempt -lt $max_retries ]; do
+            echo "Installing Docker (attempt $((attempt+1))/$max_retries)..."
+            {curl_with_retry("https://get.docker.com", follow_redirects=True, fail_early=True, output="get-docker.sh")} && bash get-docker.sh && return 0
+            attempt=$((attempt+1))
+            echo "Docker installation failed, retrying in 10 seconds..."
+            sleep 10
+        done
+        # Fallback for Rocky Linux: use CentOS repo (Rocky repo has no packages)
+        # See: https://github.com/docker/docker-install/pull/557
+        if . /etc/os-release && [ "$ID" = "rocky" ]; then
+            echo "Falling back to CentOS Docker repo for Rocky Linux..."
+            {curl_with_retry("https://download.docker.com/linux/centos/docker-ce.repo", follow_redirects=True, fail_early=True, output="/etc/yum.repos.d/docker-ce.repo")}
+            dnf install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin && return 0
+        fi
+        echo "Docker installation failed after $max_retries attempts."
+        exit 1
+    }}
+    # get.docker.com runs apt-get update, which fails at once while another apt holds the lists lock
+    {apt_lock_wait(lock_timeout=600)}
+    install_docker
+    systemctl start docker
+"""
+
+# Prints where Docker keeps image layers. With the containerd image store (the default since Docker 29, and Fedora's
+# moby-engine) that is containerd's root, not DockerRootDir.
+DOCKER_IMAGE_STORE_PROBE = """
+    if docker info --format "{{json .DriverStatus}}" | grep -q io.containerd.snapshotter; then
+        echo /var/lib/containerd
+    else
+        docker info --format "{{.DockerRootDir}}"
+    fi
+"""
+
+# Ports the monitoring stack takes on the monitor host: SCT starts it on the host network (start-all.sh -l)
+MONITORING_STACK_PORTS = {
+    3000: "Grafana",
+    8081: "Grafana renderer",
+    9090: "Prometheus",
+    9093: "Alertmanager",
+    9094: "Alertmanager gossip",
+    3100: "Loki",
+    9095: "Loki gRPC",
+    9080: "Promtail",
+    1514: "Promtail syslog",
+}
 
 LOGGER = logging.getLogger(__name__)
 
@@ -407,6 +505,7 @@ def terminate_on_failure(func):
 
     If initialization raises, the node's parent_cluster.terminate_node() is called
     (which collects logs and destroys the cloud instance) before re-raising.
+    The console output is saved first: when SSH never came up, it is the only node-side log.
     scylla_shards=0 is passed to avoid SSH calls on a node that never completed init.
     """
 
@@ -421,6 +520,7 @@ def terminate_on_failure(func):
                 self.log.error(
                     "Failed to initialize node %s, collecting logs and terminating", self.name, exc_info=True
                 )
+                self.save_console_output()
                 try:
                     self.parent_cluster.terminate_node(self, scylla_shards=0)
                 except Exception:  # noqa: BLE001
@@ -431,6 +531,8 @@ def terminate_on_failure(func):
 
 
 class BaseNode(AutoSshContainerMixin):
+    # set by report_spot_termination(); a class default so nodes built without __init__ have it too
+    spot_reclaimed = False
     CQL_PORT = 9042
     CQL_SSL_PORT = 9142
     MANAGER_AGENT_PORT = 10001
@@ -458,6 +560,8 @@ class BaseNode(AutoSshContainerMixin):
     journal_outlives_run: bool = False
     # Where the host's node_exporter serves, set by NodeExporterSetup.install on loaders and monitors
     node_exporter_port: int = NODE_EXPORTER_DEFAULT_PORT
+    # a host shared with other jobs keeps its apt-daily timers and unattended-upgrades
+    keeps_daily_apt_triggers: bool = False
 
     GOSSIP_STATUSES_FILTER_OUT = [
         "LEFT",  # in case the node was decommissioned
@@ -554,6 +658,11 @@ class BaseNode(AutoSshContainerMixin):
         When `remoter` is ready but cluster is not configured yet, `nodetool status` (and other Scylla commands) cannot be run.
         Wait when it became available.
         """
+        # A reclaimed node is gone: each command would wait out its SSH timeout (40 minutes of diagnostics in SCT-707)
+        if self.spot_reclaimed:
+            self.log.warning("Spot instance was reclaimed, skipping Scylla commands")
+            return False
+
         # During first cluster remoter is not available and may cause to failure
         if not self.remoter:
             self.log.warning("Remoter is not available")
@@ -636,13 +745,16 @@ class BaseNode(AutoSshContainerMixin):
         self.resolve_ip_addresses()
         self.log = SDCMAdapter(self.log, extra={"prefix": str(self)})
         if self.ssh_login_info:
-            self.ssh_login_info["hostname"] = self.external_address
+            self.ssh_login_info.update(self._ssh_address())
 
             self.remoter = RemoteCmdRunnerBase.create_remoter(**self.ssh_login_info)
 
             # Start task threads after ssh is up, otherwise the dense ssh attempts from task
             # threads will make SCT builder to be blocked by sshguard of gce instance.
             self.wait_ssh_up(verbose=True)
+            # A reclaim during the rest of the setup (cloud-init can take minutes) must be reported too,
+            # or SCT-707 cannot tell it from a real setup failure.
+            self.start_spot_monitoring_if_needed()
             self.wait_for_cloud_init()
 
             self._reconfigure_agent(self.remoter)
@@ -684,6 +796,24 @@ class BaseNode(AutoSshContainerMixin):
         self._start_kernel_panic_checker()
 
     def _create_kernel_panic_checker(self):
+        return None
+
+    def save_console_output(self) -> None:
+        """Save the cloud console output to `console_output.log` in the node logdir, without SSH.
+
+        The kernel panic checker saves it, but it starts only after init has passed the SSH wait.
+        """
+        if self.kernel_panic_checker:
+            return
+        try:
+            if checker := self._create_kernel_panic_checker():
+                checker.stop()  # stop() of a checker never started fetches and saves the console once
+        except Exception:  # noqa: BLE001
+            self.log.warning("Failed to save the console output", exc_info=True)
+
+    @property
+    def aws_ssm_runner(self):
+        """No SSM outside AWS: the log collector falls back to it when SSH is down."""
         return None
 
     def _start_kernel_panic_checker(self):
@@ -996,10 +1126,11 @@ class BaseNode(AutoSshContainerMixin):
         self.__dict__.pop("cql_address", None)
         self.__dict__.pop("public_dns_name", None)
         self.__dict__.pop("private_dns_name", None)
-        if self.ssh_login_info["hostname"] == self.external_address:
+        ssh_address = self._ssh_address()
+        if all(self.ssh_login_info.get(key) == value for key, value in ssh_address.items()):
             return
 
-        self.ssh_login_info["hostname"] = self.external_address
+        self.ssh_login_info.update(ssh_address)
         self.remoter.stop()
         self._init_remoter(self.ssh_login_info)
         self._init_port_mapping()
@@ -1603,6 +1734,10 @@ class BaseNode(AutoSshContainerMixin):
         else:
             return self.private_ip_address
 
+    def _ssh_address(self) -> dict:
+        """Where the runner opens SSH to: `ssh_login_info` keys to set, `hostname` at least."""
+        return {"hostname": self.external_address}
+
     @property
     def ip_ssh_connections(self) -> str:
         """How the runner reaches this node: its cluster's own setting, else the run's `ip_ssh_connections`.
@@ -1679,6 +1814,15 @@ class BaseNode(AutoSshContainerMixin):
             target=self.spot_monitoring_thread, name="SpotMonitoringThread", daemon=True
         )
         self._spot_monitoring_thread.start()
+
+    def report_spot_termination(self, message):
+        """Mark the node as reclaimed, so teardown stops running commands on it, and publish the event."""
+        self.spot_reclaimed = True
+        SpotTerminationEvent(node=self, message=message).publish()
+
+    def start_spot_monitoring_if_needed(self):
+        if (self.is_spot or self.is_gce()) and self._spot_monitoring_thread is None:
+            self.start_spot_monitoring_thread()
 
     def start_journal_thread(self):
         logs_transport = self.parent_cluster.params.get("logs_transport")
@@ -1905,8 +2049,7 @@ class BaseNode(AutoSshContainerMixin):
     @log_run_info
     def start_task_threads(self):
         self.start_journal_thread()
-        if self.is_spot or self.is_gce():
-            self.start_spot_monitoring_thread()
+        self.start_spot_monitoring_if_needed()
         if self.node_type == "db":
             self.start_coredump_thread()
             self.start_db_log_reader_thread()
@@ -2017,13 +2160,19 @@ class BaseNode(AutoSshContainerMixin):
 
         ssh_timeout_multiplier = 3
         with adaptive_timeout(Operations.SSH_CONNECTIVITY, node=self, timeout=timeout, node_available=False):
-            wait.wait_for(
-                func=self.remoter.is_up,
-                step=10 * ssh_timeout_multiplier,
-                text=text,
-                timeout=timeout * ssh_timeout_multiplier,
-                throw_exc=True,
-            )
+            try:
+                wait.wait_for(
+                    func=self.remoter.is_up,
+                    step=10 * ssh_timeout_multiplier,
+                    text=text,
+                    timeout=timeout * ssh_timeout_multiplier,
+                    throw_exc=True,
+                )
+            except WaitForTimeoutError as exc:
+                reason = f"as {self.remoter.user}@{self.remoter.hostname}"
+                if (last_error := self.remoter.last_is_up_error) is not None:
+                    reason += f", last SSH error: {last_error!r}"
+                raise WaitForTimeoutError(f"{exc} ({reason})") from exc
 
     def is_port_used(self, port: int, service_name: str) -> bool:
         """Wait for the port to be used for the specified timeout. Returns True if used and False otherwise."""
@@ -2787,77 +2936,68 @@ class BaseNode(AutoSshContainerMixin):
         The temporary keyring avoids polluting the system keyring and ensures the correct
         format for APT to use.
 
-        Tries multiple HKP keyservers in order, and falls back to HTTPS if all HKP attempts fail.
+        Each key is tried from these sources in order, until one works:
+        1. the key file Releng publishes on downloads.scylladb.com (SCYLLA_APT_KEY_URLS), the host
+           the packages come from, so the setup does not depend on a public keyserver (SCT-871:
+           a Canonical outage took keyserver.ubuntu.com down, and no other keyserver had the keys);
+        2. HKP keyservers;
+        3. keyserver.ubuntu.com over HTTPS.
+        An HTTPS import counts only when the keyring then holds the requested key id, and only the
+        requested keys are exported, so a file that carries an extra key cannot add it to apt.
         Every gpg invocation is followed by `gpgconf --kill all` so its forked helper daemons
         (`dirmngr`/`gpg-agent`) do not outlive the call inside the persistent SSH session.
         """
         self.remoter.sudo("mkdir -m 0755 -p /etc/apt/keyrings")
         temp_keyring = f"/tmp/temp-{uuid.uuid4()}.gpg"
+        gpg_temp = f"gpg --homedir /tmp --no-default-keyring --keyring {temp_keyring}"
         # gpg forks dirmngr/gpg-agent, which then get stuck in the SSH session's systemd scope,
         # delaying session teardown and tripping SSH_CONNECTIVITY soft timeouts.
         kill_gpg_daemons = "gpgconf --homedir /tmp --kill all"
+        hkp_keyservers = ["hkp://keyserver.ubuntu.com:80", "hkp://keys.openpgp.org", "hkp://pgp.mit.edu"]
+        apt_keys = self.parent_cluster.params.get("scylla_apt_keys")
+
+        def https_import(url: str, apt_key: str) -> str:
+            curl_cmd = curl_with_retry(
+                f"'{url}'",
+                silent=True,
+                follow_redirects=True,
+                fail_early=True,
+                retry=3,
+                retry_max_time=60,
+                extra_flags="-S",
+            )
+            # --list-keys fails unless the file held the key we asked for
+            return shell_script_cmd(f"{curl_cmd} | {gpg_temp} --import && {gpg_temp} --list-keys {apt_key}")
+
         try:
-            # Import all keys into a temporary keyring
-            for apt_key in self.parent_cluster.params.get("scylla_apt_keys"):
-                # List of HKP keyservers to try in order
-                hkp_keyservers = [
-                    "hkp://keyserver.ubuntu.com:80",
-                    "hkp://keys.openpgp.org",
-                    "hkp://pgp.mit.edu",
+            for apt_key in apt_keys:
+                published_url = SCYLLA_APT_KEY_URLS.get(apt_key)
+                sources = [(published_url, https_import(published_url, apt_key))] if published_url else []
+                sources += [
+                    (
+                        keyserver,
+                        f"timeout 30 {gpg_temp} --keyserver {keyserver} --keyserver-options timeout=10 --recv-keys {apt_key}",
+                    )
+                    for keyserver in hkp_keyservers
                 ]
-
-                key_fetched = False
-
-                # Try each HKP keyserver
-                for keyserver in hkp_keyservers:
-                    result = self.remoter.sudo(
-                        f"timeout 30 gpg --homedir /tmp --no-default-keyring --keyring {temp_keyring} --keyserver {keyserver} --keyserver-options timeout=10 --recv-keys {apt_key}",
-                        retry=1,
-                        ignore_status=True,
-                        timeout=120,
-                    )
+                lookup_url = f"https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x{apt_key}&options=mr"
+                sources.append((lookup_url, https_import(lookup_url, apt_key)))
+                for source, cmd in sources:
+                    result = self.remoter.sudo(cmd, retry=1, ignore_status=True, timeout=120)
                     self.remoter.sudo(kill_gpg_daemons, ignore_status=True, verbose=False, timeout=60)
                     if result.ok:
-                        LOGGER.debug("Fetched GPG key %s from %s", apt_key, keyserver)
-                        key_fetched = True
+                        LOGGER.debug("Fetched GPG key %s from %s", apt_key, source)
                         break
-
-                # If all HKP keyservers failed, try HTTPS fallback
-                if not key_fetched:
-                    https_url = f"https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x{apt_key}&options=mr"
-                    curl_cmd = curl_with_retry(
-                        f"'{https_url}'",
-                        silent=True,
-                        follow_redirects=True,
-                        fail_early=True,
-                        retry=3,
-                        retry_max_time=60,
-                        extra_flags="-S",
-                    )
-                    result = self.remoter.sudo(
-                        shell_script_cmd(
-                            f"{curl_cmd} | gpg --homedir /tmp --no-default-keyring --keyring {temp_keyring} --import"
-                        ),
-                        retry=1,
-                        ignore_status=True,
-                        timeout=120,
-                    )
-                    self.remoter.sudo(kill_gpg_daemons, ignore_status=True, verbose=False, timeout=60)
-                    if result.ok:
-                        LOGGER.debug("Fetched GPG key %s from HTTPS fallback", apt_key)
-                        key_fetched = True
-
-                # If all sources failed, raise an error
-                if not key_fetched:
+                else:
                     raise NodeSetupFailed(
                         node=self,
-                        error_msg=f"Failed to fetch GPG key {apt_key} from all keyservers and HTTPS fallback",
+                        error_msg=f"Failed to fetch GPG key {apt_key} from downloads.scylladb.com, the keyservers and the HTTPS fallback",
                     )
 
-            # Export all keys at once to the keyring file
+            # Export only the requested keys to the keyring file
             self.remoter.sudo(
                 shell_script_cmd(
-                    f"gpg --homedir /tmp --no-default-keyring --keyring {temp_keyring} --export --armor | gpg --dearmor > /etc/apt/keyrings/scylladb.gpg"
+                    f"{gpg_temp} --export --armor {' '.join(apt_keys)} | gpg --dearmor > /etc/apt/keyrings/scylladb.gpg"
                 ),
                 retry=3,
             )
@@ -4212,6 +4352,7 @@ class BaseNode(AutoSshContainerMixin):
             # NOTE: only before the run start is marked: a later call keeps the checkpoint of this run
             vector_journal_from_now=self.journal_outlives_run and not self.journal_since,
             test_config=self.test_config,
+            disable_apt_triggers=not self.keeps_daily_apt_triggers,
             # NOTE: no 'disable_guest_firewall' here on purpose - this one re-runs on a live node
             #       to re-point the logs, long after boot, and flushing the tables there would
             #       take the rules of a running network nemesis with it
@@ -4321,6 +4462,8 @@ class BaseNode(AutoSshContainerMixin):
             self.log.extra["prefix"] = str(self)
 
     def disable_daily_triggered_services(self):
+        if self.keeps_daily_apt_triggers:
+            return
         if self.distro.uses_systemd and (self.distro.is_ubuntu or self.distro.is_debian):
             self.remoter.sudo(shell_script_cmd(disable_daily_apt_triggers(), quote="'"))
 
@@ -5112,7 +5255,7 @@ class BaseCluster:
         for node in self.nodes:
             node.destroy()
 
-    def terminate_node(self, node: BaseNode, scylla_shards: int = 0) -> None:
+    def terminate_node(self, node: BaseNode, scylla_shards: int | None = None) -> None:
         # NOTE: BaseNode.scylla_shards uses SSH commands to get actual numbers which is not possible on a dead node.
         #       In such cases, a caller needs to get the number of shards before the node dies and provide it.
         if node.ip_address not in self.dead_nodes_ip_address_list:
@@ -5123,22 +5266,30 @@ class BaseCluster:
                     private_ip=node.private_ip_address,
                     ipv6_ip=node.ipv6_ip_address if self.test_config.IP_SSH_CONNECTIONS == "ipv6" else "",
                     ip_address=node.ip_address,
-                    shards=scylla_shards or node.scylla_shards,
+                    shards=node.scylla_shards if scylla_shards is None else scylla_shards,
                     termination_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
                     terminated_by_nemesis=node.running_nemesis,
                 )
             )
         if node in self.nodes:
             self.nodes.remove(node)
+        collector_class = {"loader": LoaderLogCollector, "monitor": MonitorLogCollector}.get(
+            node.node_type, ScyllaLogCollector
+        )
         try:
-            ScyllaLogCollector.cluster_log_type = node.name
-            log_links = ScyllaLogCollector(
+            # local_search_path: pick up what SCT saved locally without SSH, like console_output.log.
+            # collect_node_logs: the inactive-node scan of collect_logs() would copy those files a second time.
+            log_links = collector_class(
                 [node],
                 test_id=self.test_config.test_id(),
                 storage_dir=os.path.join(self.logdir, "collected_logs"),
                 params=self.params,
-            ).collect_logs()
-            self.test_config.argus_client().submit_sct_logs([LogLink(log_name=node.name, log_link=log_links[0])])
+                cluster_log_type=node.name,
+            ).collect_node_logs(local_search_path=node.logdir)
+            if log_links:
+                self.test_config.argus_client().submit_sct_logs([LogLink(log_name=node.name, log_link=log_links[0])])
+            else:
+                self.log.warning("No logs were collected for node %s", node.name)
         except Exception as exc:  # noqa: BLE001
             self.log.error("Failed to collect logs for node %s: %s", node.name, exc)
         with DbNodeLogger(self.nodes, "terminate node", target_node=node):
@@ -5756,6 +5907,104 @@ class NodeSetupFailed(Exception):
 
     def __repr__(self):
         return self.__str__()
+
+
+def ensure_docker_version(node: BaseNode) -> None:
+    """Preflight: the node runs Docker Engine at DOCKER_MIN_VERSION or newer.
+
+    SCT never upgrades Docker: on a shared host that restarts the daemon under other jobs' containers. A too old one
+    fails the setup, naming both versions, so the host owner can act. The server is asked as the SSH user, the way the
+    run uses it, so a stopped Docker or a user outside the `docker` group fails here too.
+    """
+    client = node.remoter.run("docker --version", ignore_status=True)
+    if client.failed:
+        raise NodeSetupFailed(node=node, error_msg="Docker is not installed")
+    if "podman" in client.stdout.lower():
+        raise NodeSetupFailed(node=node, error_msg="`docker` is the Podman shim, SCT needs Docker Engine")
+    server = node.remoter.run("docker version --format '{{.Server.Version}}'", ignore_status=True)
+    found = server.stdout.strip()
+    # An empty version: the client talks to no server, e.g. a docker context pointing elsewhere
+    if server.failed or not found:
+        raise NodeSetupFailed(node=node, error_msg=DOCKER_UNUSABLE)
+    if tuple(int(part) for part in re.findall(r"\d+", found)[:2]) >= DOCKER_MIN_VERSION:
+        return
+    needed = ".".join(map(str, DOCKER_MIN_VERSION))
+    raise NodeSetupFailed(node=node, error_msg=f"Docker {found} is older than {needed}, upgrade it on the host")
+
+
+def ensure_docker_free_space(node: BaseNode, min_free_gb: int) -> None:
+    """Fail before the first image pull when the node's Docker image store can't take the run's images.
+
+    Images no container uses are removed first. Setup fails only if the space is still short, naming the store and both
+    sizes, instead of a pull failing mid-test with "no space left on device".
+    """
+    if not min_free_gb:
+        return
+    # ponytail: assumes containerd's default root; a host with a custom `root` in containerd's config is measured wrong
+    store = node.remoter.sudo(shell_script_cmd(DOCKER_IMAGE_STORE_PROBE, quote="'"), verbose=False).stdout.split()[-1]
+
+    def free_gb() -> int:
+        # No pipe: a df failure (e.g. a missing store) fails the run with df's own error
+        return int(node.remoter.run(f"df --output=avail -BG {store}", verbose=False).stdout.split()[-1].rstrip("G"))
+
+    if (free := free_gb()) >= min_free_gb:
+        return
+    node.log.warning("Only %sGB free in %s, removing images no container uses", free, store)
+    node.remoter.sudo("docker image prune --all --force", ignore_status=True)
+    if (free := free_gb()) < min_free_gb:
+        raise NodeSetupFailed(
+            node=node,
+            error_msg=f"Docker image store {store} has {free}GB free, the run needs {min_free_gb}GB "
+            "(docker_min_free_space_gb_loader/_monitor)",
+        )
+
+
+@dataclass
+class _DockerHostCheck:
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    # The Docker roles (loader, monitor) this run has on the host, registered before any role's setup starts
+    roles: set[str] = field(default_factory=set)
+    checked: bool = False
+
+
+# Hosts of this run, by private address. A host with several roles (a lab host that is both loader and monitor) is
+# checked once, by the first role to reach it, against the sum of all its roles' space, before either role pulls.
+_DOCKER_HOST_CHECKS: dict[str, _DockerHostCheck] = {}
+
+
+def register_docker_host_role(address: str, role: str) -> None:
+    """Record that this run uses the host at `address` as a loader or monitor, for its Docker preflight."""
+    _DOCKER_HOST_CHECKS.setdefault(address, _DockerHostCheck()).roles.add(role)
+
+
+def docker_host_preflight(node: BaseNode, params, role: str) -> None:
+    """Preflight of the Docker a loader or monitor runs on: version, then free space for the images of every role the
+    host has in this run.
+    """
+    host = _DOCKER_HOST_CHECKS.setdefault(node.private_ip_address, _DockerHostCheck())
+    with host.lock:
+        if host.checked:
+            return
+        ensure_docker_version(node)
+        min_free_gb = sum(params.get(f"docker_min_free_space_gb_{each}") or 0 for each in host.roles | {role})
+        ensure_docker_free_space(node, min_free_gb)
+        host.checked = True
+
+
+def ensure_monitoring_ports_free(node: BaseNode) -> None:
+    """Preflight: the monitoring stack's ports are free on the monitor host.
+
+    A taken port fails the setup naming the port and what holds it, before any container starts. Lab host owners keep
+    these ports free (e.g. Fedora's Cockpit, on 9090, is disabled on lab hosts).
+    """
+    taken = {}
+    for line in node.remoter.sudo("ss -Hltnp", verbose=False).stdout.splitlines():
+        fields = line.split()
+        port = int(fields[3].rsplit(":", 1)[1])
+        if service := MONITORING_STACK_PORTS.get(port):
+            taken.setdefault(port, f"{port} ({service}) is held by {fields[5] if len(fields) > 5 else 'a process'}")
+    if taken:
+        raise NodeSetupFailed(node=node, error_msg=f"Monitoring stack ports are taken: {'; '.join(taken.values())}")
 
 
 class NodeSetupTimeout(Exception):
@@ -7443,6 +7692,9 @@ class BaseScyllaCluster:
 
 
 class BaseLoaderSet:
+    # False for a host other jobs share: setup then leaves its Docker alone, and the preflight check fails a missing one
+    owns_host = True
+
     def __init__(self, params):
         self._loader_cycle = None
         self.params = params
@@ -7509,12 +7761,14 @@ class BaseLoaderSet:
             '>> /etc/security/limits.d/20-coredump.conf"'
         )
         if result.exit_status == 0:
+            # Its Docker and images come with the image: a prune for space would remove the pre-pulled images
             node.log.debug("Skip loader setup for using a prepared AMI")
         else:
-            if node.distro.is_fedora:
-                self._install_docker_on_fedora(node)
-            node.remoter.run("sudo usermod -aG docker $USER", change_context=True)
-
+            if self.owns_host:
+                if node.distro.is_fedora:
+                    self._install_docker_on_fedora(node)
+                node.remoter.run("sudo usermod -aG docker $USER", change_context=True)
+            docker_host_preflight(node, self.params, "loader")
         # Login to Docker Hub.
         docker_hub_login(remoter=node.remoter)
 
@@ -7635,6 +7889,9 @@ class BaseLoaderSet:
 class BaseMonitorSet:
     # This is a Mixin for monitoring cluster and should not be inherited
     DB_NODES_IP_ADDRESS = "ip_address"
+    # False for a host other jobs share: setup then leaves its Docker, firewall and packages alone, and fails a stack
+    # that doesn't start instead of restarting it
+    owns_host = True
     json_file_params_for_replace = {"$test_name": get_test_name()}
     # Parallel callers (e.g. parallel decommissions) race on the same targets files
     _reconfigure_lock = threading.Lock()
@@ -7760,7 +8017,7 @@ class BaseMonitorSet:
         node.wait_ssh_up()
         node.install_minicloud_ca()
 
-        if node.distro.is_rhel_like or self.params.get("cluster_backend") == "oci":
+        if self.owns_host and (node.distro.is_rhel_like or self.params.get("cluster_backend") == "oci"):
             node.disable_firewall()
             node.upgrade_ssh_packages()
 
@@ -7784,6 +8041,8 @@ class BaseMonitorSet:
         try:
             self.start_scylla_monitoring(node)
         except Failure, UnexpectedExit, Libssh2_UnexpectedExit:
+            if not self.owns_host:
+                raise
             self.restart_scylla_monitoring()
         # The time will be used in url of Grafana monitor,
         # the data from this point to the end of test will
@@ -7883,107 +8142,24 @@ class BaseMonitorSet:
                 docker_hub_login(remoter=node.remoter)
             return
 
-        node.update_repo_cache()
+        missing = node.remoter.run(shell_script_cmd(MONITOR_PREREQS_PROBE, quote="'"), verbose=False).stdout.split()
+        node.log.info("Missing monitor prerequisites: %s", missing or "none")
 
-        prereqs_script = f"wait_for_apt_lock() {{ {apt_lock_wait(lock_timeout=600)}; }}\n" + dedent("""
-            # Function to install Docker and Python basics on Debian/Ubuntu
-            install_debian_pkgs() {
-                echo "Detected Debian/Ubuntu system..."
+        # node_setup refreshed the repo cache just before
+        if packages := [item for item in missing if item in MONITOR_PREREQ_PACKAGES]:
+            node.install_package(" ".join(packages))
 
-                # 1. Wait for apt lock and update existing list of packages
-                wait_for_apt_lock
-                apt-get update
+        if "python-libs" in missing:
+            node.remoter.sudo(shell_script_cmd(MONITOR_PYTHON_LIBS_INSTALL_SCRIPT, quote="'"))
 
-                # 2. Install Docker prerequisites and basic Python
-                apt-get install -y \\
-                    curl \\
-                    unzip \\
-                    python3 \\
-                    python3-pip
-            }
-
-            # Function to install Docker and Python basics on CentOS/RHEL/Fedora
-            install_centos_pkgs() {
-                echo "Detected CentOS/RHEL system..."
-
-                # 1. Install basic python
-                yum install -y python3 python3-pip curl unzip wget
-            }
-
-            # Function to manage Pip and install libraries
-            install_python_libs() {
-                echo "Configuring Python environment..."
-
-                # Base pip command
-                PIP_CMD="pip3 install"
-                PIP_ARGS=""
-
-                # Check if current pip supports/requires --break-system-packages
-                if pip3 install --help | grep -q "break-system-packages"; then
-                    echo "PEP 668 detected: Enabling --break-system-packages flag."
-                    PIP_ARGS="--break-system-packages"
-                fi
-
-                # Install libraries (skip pip upgrade to avoid conflicts with system pip)
-                echo "Installing pyyaml and psutil..."
-                $PIP_CMD $PIP_ARGS pyyaml psutil
-
-                if [ $? -eq 0 ]; then
-                    echo "Python libraries installed successfully."
-                else
-                    echo "Failed to install Python libraries."
-                    exit 1
-                fi
-            }
-            install_docker() {
-                local max_retries=3
-                local attempt=0
-                while [ $attempt -lt $max_retries ]; do
-                    echo "Installing Docker (attempt $((attempt+1))/$max_retries)..."
-                    curl -fsSL https://get.docker.com --retry 5 --retry-max-time 300 $(curl --retry-all-errors --version >/dev/null 2>&1 && echo --retry-all-errors) -o get-docker.sh && \
-                        bash get-docker.sh && return 0
-                    attempt=$((attempt+1))
-                    echo "Docker installation failed, retrying in 10 seconds..."
-                    sleep 10
-                done
-                # Fallback for Rocky Linux: use CentOS repo (Rocky repo has no packages)
-                # See: https://github.com/docker/docker-install/pull/557
-                if . /etc/os-release && [ "$ID" = "rocky" ]; then
-                    echo "Falling back to CentOS Docker repo for Rocky Linux..."
-                    curl -fsSL https://download.docker.com/linux/centos/docker-ce.repo --retry 5 --retry-max-time 300 $(curl --retry-all-errors --version >/dev/null 2>&1 && echo --retry-all-errors) -o /etc/yum.repos.d/docker-ce.repo
-                    dnf install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin && return 0
-                fi
-                echo "Docker installation failed after $max_retries attempts."
-                exit 1
-            }
-
-            start_docker() {
-                systemctl start docker
-            }
-
-            # Main execution logic
-            if [ -f /etc/debian_version ]; then
-                install_debian_pkgs
-                install_docker
-                install_python_libs
-                start_docker
-            elif [ -f /etc/redhat-release ]; then
-                install_centos_pkgs
-                install_docker
-                install_python_libs
-                start_docker
-            else
-                echo "Unsupported Operating System. This script supports Debian/Ubuntu or CentOS/RHEL."
-                exit 1
-            fi
-        """)
+        if docker_problem := {"docker", "docker-group"}.intersection(missing):
+            if not self.owns_host:
+                raise NodeSetupFailed(node=node, error_msg=DOCKER_UNUSABLE)
+            if "docker" in docker_problem:
+                node.remoter.sudo(shell_script_cmd(DOCKER_INSTALL_SCRIPT, quote="'"))
+            node.remoter.run("sudo usermod -aG docker $USER", change_context=True)
 
         node.node_exporter_port = self.install_node_exporter(node)
-
-        node.remoter.run(cmd="sudo bash -ce '%s'" % prereqs_script)
-        node.remoter.run("sudo usermod -aG docker $USER", change_context=True)
-
-        node.remoter.run(cmd="sudo systemctl restart docker", timeout=60)
 
         docker_hub_login(remoter=node.remoter)
 
@@ -7992,13 +8168,20 @@ class BaseMonitorSet:
         # The monitor's own target is its private address
         return NodeExporterSetup().install(node, scrape_host=normalize_ipv6_url(node.private_ip_address))
 
+    def preflight_check(self, node):
+        """Fail before any image pull or container start if the host can't run the monitoring stack."""
+        docker_host_preflight(node, self.params, "monitor")
+        # A formal monitoring image may start its own stack at boot, on these same ports
+        if not self.is_formal_monitor_image:
+            ensure_monitoring_ports_free(node)
+
     def download_scylla_monitoring(self, node):
         install_script = dedent(
             f"""
             rm -rf {self.monitor_install_path_base}
             mkdir -p {self.monitor_install_path_base}
             cd {self.monitor_install_path_base}
-            wget https://github.com/scylladb/scylla-monitoring/archive/{self.monitor_branch}.zip
+            {curl_with_retry(f"https://github.com/scylladb/scylla-monitoring/archive/{self.monitor_branch}.zip", follow_redirects=True, fail_early=True, output=f"{self.monitor_branch}.zip")}
             rm -rf ./tmp {self.monitor_install_path} 2>/dev/null
             unzip {self.monitor_branch}.zip -d ./tmp
             mv ./tmp/scylla-monitoring-{self.monitor_branch}/ {self.monitor_install_path}
@@ -8511,6 +8694,7 @@ class BaseMonitorSet:
     @log_run_info
     def install_scylla_monitoring(self, node):
         self.install_scylla_monitoring_prereqs(node)
+        self.preflight_check(node)
         if not self.is_formal_monitor_image:
             self.download_scylla_monitoring(node)
 
@@ -8558,16 +8742,9 @@ class BaseMonitorSet:
 
     def get_grafana_screenshots(self, node: BaseNode, test_start_time: float) -> list[str]:
         screenshot_links = []
-        grafana_extra_dashboards = []
-        if "alternator_port" in self.params:
-            grafana_extra_dashboards = [AlternatorDashboard()]
-        if self.params.get("gemini_cmd"):
-            grafana_extra_dashboards.append(GeminiDashboard())
         date_time = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
-        screenshot_collector = GrafanaScreenShot(
-            name="grafana-screenshot", test_start_time=test_start_time, extra_entities=grafana_extra_dashboards
-        )
+        screenshot_collector = GrafanaScreenShot(name="grafana-screenshot", test_start_time=test_start_time)
         screenshot_collector.set_params(self.params)
         screenshot_files = screenshot_collector.collect(node, self.logdir)
         for screenshot in screenshot_files:

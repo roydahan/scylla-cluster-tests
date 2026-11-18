@@ -195,7 +195,7 @@ Every pull request must be reviewed before merging. Reviewers should check for:
   for testing guidance. For changes that automated CI cannot cover (e.g., Jenkins
   pipeline or provisioning changes), manually triggering the affected pipelines may
   be necessary before merging
-- **Style and conventions** — see [`AGENTS.md`](../AGENTS.md) for the full style guide
+- **Style and conventions** — see the standards indexed in [`docs/INDEX.md`](INDEX.md)
 - **Security** — no credential leaks, no injection vulnerabilities, no secrets in config
   files. See section 7 (Security) for details
 - **Performance** — no unnecessary loops over large datasets, no blocking calls in async
@@ -448,7 +448,6 @@ with the PR workflow and reduced Jenkins dependency.
 | [`add-label-when-promoted`](../.github/workflows/add-label-when-promoted.yaml) | Push to `master`/`branch-*`/`manager-*`; `backport/*` label added | Legacy in-repo auto-backport — superseded by `call_backport_with_jira` (see section 3.3) |
 | [`auto_assign`](../.github/workflows/auto_assign.yaml) | PR/issue opened | Auto-assigns the author to their PR/issue |
 | [`claude`](../.github/workflows/claude.yml) | `@claude` mention in comments/issues | Triggers Claude AI agent for code tasks |
-| [`ai-assisted-label`](../.github/workflows/ai-assisted-label.yaml) | PR open/sync | Labels PRs that contain AI-assistance markers as `ai-assisted` |
 | [`skill-review`](../.github/workflows/skill-review.yml) | PR touching `skills/**` | Reviews skill definitions for quality |
 | [`call_jira_sync`](../.github/workflows/call_jira_sync.yml) | PR events | Syncs PR status to Jira tickets |
 | [`build-docker-image`](../.github/workflows/build-docker-image.yaml) | `New Hydra Version` label | Builds and pushes a new Hydra Docker image |
@@ -462,14 +461,39 @@ SCT integrates AI agents into the CI workflow for code review and task execution
 See also section 2.1 for review expectations that apply to both human and AI
 reviewers.
 
-**Automated code review** — PRs are reviewed automatically by CodeRabbit and
-GitHub Copilot. CodeRabbit is configured in [`.coderabbit.yaml`](../.coderabbit.yaml),
-which skips backport PRs and anything labeled `skip-review`. These reviews
-supplement, but do not replace, human review: treat bot findings as suggestions to
-verify against the code, not as rulings.
+**AI code review** — four AI reviewers can review a PR: CodeRabbit, Qodo,
+GitHub Copilot, and Claude. Each one follows [`REVIEW.md`](../REVIEW.md) and the standards in
+[`docs/standards/`](standards/); their configuration holds no rules of its own.
+CodeRabbit and Qodo review each non-draft, non-backport PR to `master` once,
+when it opens or leaves draft. They do not review new commits. Claude and
+Copilot run on request. On the same PRs, a bot posts these commands once:
+
+| Reviewer | How to request (again) | Configuration |
+|----------|----------------|---------------|
+| CodeRabbit | Comment `@coderabbitai review` (incremental) or `@coderabbitai full review` | [`.coderabbit.yaml`](../.coderabbit.yaml) |
+| Qodo | Comment `/agentic_review` | [`.pr_agent.toml`](../.pr_agent.toml) |
+| Copilot | Reviewers menu → Copilot, or `gh pr edit <number> --add-reviewer @copilot` | Reads `REVIEW.md` and `AGENTS.md` directly |
+| Claude | Comment `@claude review` (org members) | [`claude-review.yml`](../.github/workflows/claude-review.yml), with the `code-review` skill |
+
+To silence the automatic reviews, add the `skip-review` label before the PR
+opens, or while it is a draft. That PR then gets no automatic review and no
+how-to comment. On an open PR, comment `@coderabbitai pause` to stop CodeRabbit.
+The automatic reviews are a trial: after it, only the reviewer that authors act
+on most stays automatic. The design and the selection data are in
+[`docs/plans/ai-tooling/review-tools/spec.md`](plans/ai-tooling/review-tools/spec.md).
+These reviews supplement, but do not replace, human review: treat bot findings as
+suggestions to verify against the code, not as rulings.
+
+To run a reviewer on your machine before you push, or without a PR comment,
+follow the [`running-ai-reviewers`](../skills/running-ai-reviewers/SKILL.md) skill.
+It runs Claude (the `code-review` skill, with your Claude team login) or the
+CodeRabbit CLI (GitHub login; reviews count against the scylladb plan) with the
+same `REVIEW.md`, and posts nothing.
+Qodo and Copilot run only on the PR; for a branch without one, open a draft PR.
 
 **On-demand task execution** — mentioning `@claude` in a PR comment or issue
-triggers the [`claude`](../.github/workflows/claude.yml) workflow. This is
+triggers the [`claude`](../.github/workflows/claude.yml) workflow, except a
+comment that starts with `@claude review`, which requests a review (see above). This is
 restricted to org members and collaborators. Claude can:
 - Implement code changes and push commits
 - Fix backport conflicts

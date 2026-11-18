@@ -214,6 +214,10 @@ data_volume_disk_num: 0
 data_volume_disk_type: ''
 data_volume_disk_size: 0
 data_volume_disk_iops: 0 # depend on type iops could be 100-16000 for io2|io3 and 3000-16000 for gp3
+
+# measured on a lab host: the stress tool images take ~1.5GB and the monitoring stack ~5GB, unpacked about twice that
+docker_min_free_space_gb_loader: 3
+docker_min_free_space_gb_monitor: 10
 gce_pd_standard_disk_size_db: 0
 
 install_mode: 'repo'  # install from scylla_repo
@@ -221,13 +225,10 @@ run_db_node_benchmarks: false
 
 nemesis_multiply_factor: 2
 
+# Only the keys that sign the repos SCT installs from; both are published on downloads.scylladb.com/downloads/gpg/
 scylla_apt_keys:
-  - '17723034C56D4B19'  # ScyllaDB Package Signing Key 2018 <security@scylladb.com>
-  - '5E08FBD8B5D6EC9C'  # ScyllaDB Package Signing Key 2020 <security@scylladb.com>
-  - 'D0A112E067426AB2'  # ScyllaDB Package Signing Key 2022 <security@scylladb.com>
-  - '491C93B9DE7496A7'  # ScyllaDB Package Signing Key 2024 <security@scylladb.com>
-  - 'A43E06657BAC99E3'  # ScyllaDB Package Signing Key 2024 (RSA) <security@scylladb.com>
-  - 'C503C686B007F39E'  # ScyllaDB Package Signing Key 2026 (RSA) <security@scylladb.com>
+  - 'A43E06657BAC99E3'  # ScyllaDB Package Signing Key 2024 (RSA): 2025.x, 6.2, Manager 3.3-3.8
+  - 'C503C686B007F39E'  # ScyllaDB Package Signing Key 2026 (RSA): 2026.x, master, Manager 3.9+
 
 raid_level: 0
 
@@ -255,6 +256,7 @@ gce_spot_obtainability_min: 0.0
 
 # 12h. Tests longer than this default to on_demand: spot interruption exposure grows with runtime.
 spot_max_test_duration: 720
+spot_termination_retry: []
 
 enable_argus: true
 argus_use_ssh_tunnel: true
@@ -401,6 +403,14 @@ vector_store_version: ''
 vector_store_scylla_username: ''
 vector_store_scylla_password: ''
 vector_store_service_level_shares: 1000
+# Both must stay empty: setting either one is what requests a source build over the base AMI.
+# The fallbacks applied once one of them is set live in sdcm/utils/vector_store_utils.py.
+vector_store_source_repo: ''
+vector_store_source_ref: ''
+# Covers apt, the rustup bootstrap and a cold 'cargo build --release' on the small instance types
+# the VS nodes use. Note this is per node: the builds run one after another, see
+# VectorStoreSetAWS._reconfigure_vector_store_nodes.
+vector_store_source_build_timeout: 3600
 docker_image_cassandra: 'cassandra'
 cassandra_version: '4.1'
 cassandra_num_tokens: 16

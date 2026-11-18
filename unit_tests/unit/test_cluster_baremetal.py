@@ -27,6 +27,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from sdcm import cluster as sdcm_cluster
+from sdcm import cluster_baremetal
 from sdcm.cluster_baremetal import (
     BASELINE_MAX_AGE_DAYS,
     LIST_PACKAGES,
@@ -34,12 +35,15 @@ from sdcm.cluster_baremetal import (
     PACKAGE_BASELINE,
     SCYLLA_COREDUMP_MOUNT_UNIT,
     SERVICE_BASELINE,
+    MonitorSetPhysical,
     NodeIpsNotConfiguredError,
     PhysicalHost,
     PhysicalMachineCluster,
     PhysicalMachineNode,
 )
+from sdcm.keystore import KeyStore
 from sdcm.test_config import TestConfig
+from sdcm.tester import ClusterTester
 
 
 def _cluster(node_count: int, racks_count: int) -> MagicMock:
@@ -793,6 +797,16 @@ def test_private_node_on_a_public_run_opens_no_tunnels(monkeypatch):
     release.assert_not_called()
 
 
+def test_host_reached_through_the_lab_access_service_is_private_on_a_public_role():
+    """The access service blocks SSH port forwarding, so such a host can't get reverse tunnels."""
+    node = _node_with_listeners("")
+    node.test_config.IP_SSH_CONNECTIONS = "public"
+    node.parent_cluster.ip_ssh_connections = "public"
+    node._access_name = "monster"
+
+    assert node.ip_ssh_connections == "private"
+
+
 def test_stale_tunnels_released_once_per_shared_host(monkeypatch):
     """A loader and a monitor on one host: the second node must not kill the tunnel the first one just opened."""
     monkeypatch.setattr(PhysicalMachineNode, "_tunnel_ports_released_on", set())
@@ -1304,7 +1318,8 @@ def test_the_db_host_cleanup_stops_scylla_restores_packages_then_removes_leftove
     assert calls == ["log followers", "systemctl stop scylla-server.service", "packages", "services", "leftovers"]
 
 
-def test_a_loader_host_cleanup_skips_the_scylla_steps(monkeypatch):
+def test_a_loader_host_cleanup_skips_the_scylla_steps_and_the_baseline_restore(monkeypatch):
+    """Other jobs share a loader or monitor host: a restore would remove the packages they installed."""
     host = _host_with_disk_state()
     calls = []
     monkeypatch.setattr(host, "_stop_stale_log_followers", lambda: calls.append("log followers"))
@@ -1312,10 +1327,36 @@ def test_a_loader_host_cleanup_skips_the_scylla_steps(monkeypatch):
     monkeypatch.setattr(host, "restore_services", lambda: calls.append("services"))
     monkeypatch.setattr(host, "remove_scylla_leftovers", lambda: calls.append("leftovers"))
 
-    host.clean_up_host(tunnel_ports=False, scylla_disk_setup=False)
+    host.clean_up_host(tunnel_ports=False, scylla_disk_setup=False, restore_baseline=False)
 
-    assert calls == ["log followers", "packages", "services"]
+    assert calls == ["log followers"]
     host.remoter.sudo.assert_not_called()
+
+
+def test_a_monitor_host_cleanup_removes_only_the_runs_monitoring_stack(monkeypatch):
+    """The run's own stack (containers with its TestId label and NodeType=monitor, the mountless renderer too) and
+    directory go; other runs' stacks and the run's stress containers stay.
+    """
+    host = _host_with_disk_state()
+    monkeypatch.setattr(host, "_stop_stale_log_followers", lambda: None)
+
+    host.clean_up_host(tunnel_ports=False, scylla_disk_setup=False, restore_baseline=False, monitoring_stack_of="1234")
+
+    host.remoter.run.assert_called_once_with(
+        "docker ps -aq --filter label=TestId=1234 --filter label=NodeType=monitor | xargs -r docker rm -f"
+    )
+    host.remoter.sudo.assert_called_once_with('rm -rf "$HOME/sct-monitoring-1234"')
+
+
+def test_the_baremetal_monitor_restart_stops_only_its_own_stack():
+    """A restart (REUSE_CLUSTER) stops the run's stack, not every container with the stack's default names."""
+    node = MagicMock()
+    node.tags = {"TestId": "1234"}
+
+    MonitorSetPhysical.stop_scylla_monitoring(MagicMock(), node)
+
+    node.stop_monitoring_stack.assert_called_once_with("1234")
+    node.remoter.run.assert_not_called()
 
 
 def test_a_failed_package_restore_does_not_skip_the_leftovers(monkeypatch):
@@ -1335,6 +1376,7 @@ def test_the_node_records_the_baseline_before_installing_anything(monkeypatch):
     """BaseNode.init() installs vector and rsync once SSH is up: the baseline must not have them."""
     calls = []
     node = PhysicalMachineNode.__new__(PhysicalMachineNode)
+    node.node_type = "db"
     node.ssh_login_info = {"hostname": None}
     node.logdir = None
     node.log = MagicMock()
@@ -1357,6 +1399,7 @@ def test_the_node_records_the_baseline_before_installing_anything(monkeypatch):
 
 def test_a_baseline_that_fails_to_record_does_not_fail_the_node():
     node = PhysicalMachineNode.__new__(PhysicalMachineNode)
+    node.node_type = "db"
     node.log = MagicMock()
     node.record_host_baseline = MagicMock(side_effect=RuntimeError("rpm: exited with 1"))
 
@@ -1364,6 +1407,63 @@ def test_a_baseline_that_fails_to_record_does_not_fail_the_node():
 
     node.record_host_baseline.assert_called_once()
     assert "leaves them as they are" in node.log.warning.call_args.args[0]
+
+
+@pytest.mark.parametrize("node_type", ["loader", "monitor"])
+def test_a_shared_host_records_no_baseline(node_type):
+    node = PhysicalMachineNode.__new__(PhysicalMachineNode)
+    node.node_type = node_type
+    node.record_host_baseline = MagicMock()
+
+    node.wait_for_cloud_init()
+
+    node.record_host_baseline.assert_not_called()
+
+
+@pytest.mark.parametrize("node_type,disabled", [("db", True), ("loader", False), ("monitor", False)])
+def test_only_a_db_host_gets_its_daily_apt_timers_disabled(node_type, disabled):
+    """Loader and monitor hosts are shared: their apt-daily timers stay on."""
+    node = PhysicalMachineNode.__new__(PhysicalMachineNode)
+    node.node_type = node_type
+    node.distro = MagicMock(uses_systemd=True, is_ubuntu=True)
+    node.remoter = MagicMock()
+
+    node.disable_daily_triggered_services()
+
+    assert node.remoter.sudo.called == disabled
+
+
+@pytest.mark.parametrize(
+    "node_class,node_type,disabled",
+    [
+        pytest.param(PhysicalMachineNode, "db", True, id="baremetal-db"),
+        pytest.param(PhysicalMachineNode, "loader", False, id="baremetal-loader"),
+        pytest.param(PhysicalMachineNode, "monitor", False, id="baremetal-monitor"),
+        pytest.param(sdcm_cluster.BaseNode, "loader", True, id="cloud-loader"),
+    ],
+)
+def test_the_logging_script_leaves_the_apt_timers_of_a_shared_host_on(node_class, node_type, disabled):
+    """The first run on a host also disables the apt-daily timers in its logging setup script: not on a shared host."""
+    node = node_class.__new__(node_class)
+    node.name = "node-1"
+    node.node_type = node_type
+    node.journal_since = None
+    node.parent_cluster = MagicMock(params={"logs_transport": "vector"})
+    node.test_config = MagicMock(get_logging_service_host_port=MagicMock(return_value=("127.0.0.1", 5003)))
+    node.remoter = MagicMock()
+
+    node.configure_remote_logging()
+
+    script = node.remoter.sudo.call_args.args[0]
+    assert ("systemctl disable apt-daily.timer" in script) == disabled
+    assert ("unattended-upgrades" in script) == disabled
+
+
+def test_each_run_gets_its_own_monitoring_directory():
+    node = MagicMock(tags={"TestId": "1234-abcd"})
+    node.remoter.run.return_value = MagicMock(stdout="/home/fedora\n")
+
+    assert str(MonitorSetPhysical.get_monitor_install_path_base(node)) == "/home/fedora/sct-monitoring-1234-abcd"
 
 
 def _host_with_log_followers(leaders: str) -> PhysicalHost:
@@ -1407,3 +1507,135 @@ def test_logs_go_to_the_tunnel_or_straight_to_the_runner_per_node(node_setting, 
     monkeypatch.setattr(TestConfig, "VECTOR_SSH_TUNNEL_LOCAL_PORT", 5001)
 
     assert TestConfig.get_logging_service_host_port(node_setting) == expected
+
+
+def test_access_name_routes_ssh_where_the_lab_access_service_says(monkeypatch):
+    """A lab host with an access name is reached at the address the lab access service gives, not its own."""
+    node = _node_with_listeners("")
+    node._access_name = "monster"
+    node.parent_cluster.params = {"test_duration": 1440}
+    localhost = MagicMock()
+    localhost.lab_access_ssh_address.return_value = {"hostname": "172.17.0.5", "port": 10027}
+    monkeypatch.setattr(TestConfig, "tester_obj", lambda self: MagicMock(localhost=localhost))
+
+    # no SCT key: the access service accepts only `none` auth
+    assert node._ssh_address() == {"hostname": "172.17.0.5", "port": 10027, "key_file": None}
+    # access lasts the run, its log collection and its cleanup, not the service's default
+    localhost.lab_access_ssh_address.assert_called_once_with("monster", duration="1680m")
+
+
+@pytest.mark.parametrize(
+    "use_mgmt, access_names, refused",
+    [
+        pytest.param(True, ["monster"], True, id="manager-on-access-monitor"),
+        pytest.param(False, ["monster"], False, id="no-manager"),
+        pytest.param(True, [None], False, id="monitor-at-an-address"),
+    ],
+)
+def test_manager_on_a_lab_access_monitor_is_refused_up_front(monkeypatch, use_mgmt, access_names, refused):
+    """install_mgmt copies the SSH key, which a lab access login doesn't have: say so before the setup fails."""
+    built = MagicMock()
+    monkeypatch.setattr(sdcm_cluster.BaseMonitorSet, "__init__", lambda self, **kwargs: built())
+    monkeypatch.setattr(PhysicalMachineCluster, "__init__", lambda self, **kwargs: built())
+    kwargs = dict(user_prefix="t", params={"use_mgmt": use_mgmt}, targets={}, access_names=access_names)
+
+    if refused:
+        with pytest.raises(ValueError, match="use_mgmt"):
+            cluster_baremetal.MonitorSetPhysical(**kwargs)
+        built.assert_not_called()
+    else:
+        cluster_baremetal.MonitorSetPhysical(**kwargs)
+        assert built.call_count == 2
+
+
+def test_host_without_access_name_is_reached_at_its_address(monkeypatch):
+    node = _node_with_listeners("")
+    node._access_name = None
+    monkeypatch.setattr(PhysicalMachineNode, "external_address", "10.0.0.60")
+
+    assert node._ssh_address() == {"hostname": "10.0.0.60"}
+
+
+def test_refresh_rebuilds_the_remoter_when_only_the_port_changes(monkeypatch):
+    """Through the lab access service the address stays and the port moves: that is a new SSH address too."""
+    node = _node_with_listeners("")
+    node.ssh_login_info = {"hostname": "172.17.0.5", "port": 10027, "user": "jenkins"}
+    monkeypatch.setattr(PhysicalMachineNode, "_ssh_address", lambda self: {"hostname": "172.17.0.5", "port": 10031})
+    node.invalidate_ip_address_cache = MagicMock()
+    node._init_remoter = MagicMock()
+    node._init_port_mapping = MagicMock()
+
+    node.refresh_ip_address()
+
+    assert node.ssh_login_info == {"hostname": "172.17.0.5", "port": 10031, "user": "jenkins"}
+    node._init_remoter.assert_called_once_with(node.ssh_login_info)
+
+
+def test_hosts_config_gives_each_role_its_own_addresses_access_and_setting(monkeypatch):
+    """Each role is built from its own section; a host with no public address is reached at its private one."""
+    hosts = {
+        "db_nodes": {
+            "username": "centos",
+            "ip_ssh_connections": "public",
+            "node_list": [{"public_ip": "3.3.3.3", "private_ip": "10.0.0.1"}],
+        },
+        "loader_nodes": {
+            "username": "jenkins",
+            "ip_ssh_connections": "private",
+            "node_list": [{"private_ip": "10.0.0.60", "access": "monster"}],
+        },
+        "monitor_nodes": {"username": "jenkins", "node_list": [{"private_ip": "10.0.0.60"}]},
+    }
+    built = {}
+    for cls in ("ScyllaPhysicalCluster", "LoaderSetPhysical", "MonitorSetPhysical"):
+        monkeypatch.setattr(cluster_baremetal, cls, lambda cls=cls, **kwargs: built.setdefault(cls, kwargs))
+    monkeypatch.setattr(KeyStore, "get_baremetal_config", lambda self, name: hosts)
+    tester = MagicMock(params={"s3_baremetal_config": "hosts", "user_credentials_path": "~/.ssh/key"}, credentials=[])
+
+    ClusterTester.get_cluster_baremetal(tester)
+
+    roles = {
+        cls: {
+            key: kwargs[key]
+            for key in ("public_ips", "private_ips", "access_names", "ssh_username", "ip_ssh_connections")
+        }
+        for cls, kwargs in built.items()
+    }
+    assert roles == {
+        "ScyllaPhysicalCluster": {
+            "public_ips": ["3.3.3.3"],
+            "private_ips": ["10.0.0.1"],
+            "access_names": [None],
+            "ssh_username": "centos",
+            "ip_ssh_connections": "public",
+        },
+        "LoaderSetPhysical": {
+            "public_ips": ["10.0.0.60"],
+            "private_ips": ["10.0.0.60"],
+            "access_names": ["monster"],
+            "ssh_username": "jenkins",
+            "ip_ssh_connections": "private",
+        },
+        "MonitorSetPhysical": {
+            "public_ips": ["10.0.0.60"],
+            "private_ips": ["10.0.0.60"],
+            "access_names": [None],
+            "ssh_username": "jenkins",
+            "ip_ssh_connections": None,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "node_type,registered", [("loader", {"loader"}), ("monitor", {"monitor"}), ("scylla-db", None)]
+)
+def test_loader_and_monitor_hosts_are_registered_for_their_docker_preflight(monkeypatch, node_type, registered):
+    """Registered at construction, before any setup, so a loader+monitor host is checked once for both roles."""
+    monkeypatch.setattr(sdcm_cluster.BaseCluster, "__init__", lambda self, **kwargs: None)
+
+    PhysicalMachineCluster(
+        credentials=[MagicMock()], n_nodes=1, public_ips=["1.0.0.1"], private_ips=["10.0.0.1"], node_type=node_type
+    )
+
+    host = sdcm_cluster._DOCKER_HOST_CHECKS.get("10.0.0.1")
+    assert (host.roles if host else None) == registered
