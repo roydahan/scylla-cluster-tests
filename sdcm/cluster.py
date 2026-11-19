@@ -203,8 +203,8 @@ from sdcm.utils.grafana_api import (
     upload_dashboard,
 )
 from sdcm.utils.health_checker import (
+    CHECK_NODE_HEALTH_MAX_RETRY_DELAY,
     CHECK_NODE_HEALTH_RETRIES,
-    CHECK_NODE_HEALTH_RETRY_DELAY,
     check_group0_tokenring_consistency,
     check_node_status_in_gossip_and_nodetool_status,
     check_nodes_status,
@@ -222,6 +222,7 @@ from sdcm.utils.ldap import (
     LDAP_USERS,
 )
 from sdcm.utils.minicloud.endpoint import MINICLOUD_GUEST_CA_URL, is_minicloud_active
+from sdcm.utils.minicloud.io_properties import override_content
 from sdcm.utils.minicloud.preflight import scylla_reserve_memory
 from sdcm.utils.net import get_my_ip, to_inet_ntop_format
 from sdcm.utils.node import build_node_api_command
@@ -243,7 +244,7 @@ from sdcm.utils.version_utils import (
     get_systemd_version,
     is_enterprise,
 )
-from sdcm.wait import wait_for_log_lines
+from sdcm.wait import exponential_backoff_delay, wait_for_log_lines
 
 # Test duration (min). Parameter used to keep instances produced by tests that
 # are supposed to run longer than 24 hours from being killed
@@ -4139,12 +4140,13 @@ class BaseNode(AutoSshContainerMixin):
 
             event.dont_publish()
 
+            delay = exponential_backoff_delay(retry_n, CHECK_NODE_HEALTH_MAX_RETRY_DELAY)
             LOGGER.debug(
                 "Wait for %d secs before next try to validate the health of the node `%s'",
-                CHECK_NODE_HEALTH_RETRY_DELAY,
+                delay,
                 self.name,
             )
-            time.sleep(CHECK_NODE_HEALTH_RETRY_DELAY)
+            time.sleep(delay)
 
     def get_nodes_status(self, nodes: list[BaseNode] | None = None) -> dict[BaseNode, dict]:
         nodes_status = {}
@@ -7002,11 +7004,20 @@ class BaseScyllaCluster:
     def _deploy_scylla_d_overrides(self, node: BaseNode) -> None:
         for config_file_path in self.params.get("scylla_d_overrides_files"):
             config_file = Path(get_sct_root_path()) / config_file_path
+            text = config_file.read_text()
+            content = override_content(config_file, text, self.params)
+            if content != text:
+                self.log.info(
+                    "minicloud: %s for %s is the host figure scaled per db guest:\n%s",
+                    config_file.name,
+                    node.name,
+                    content,
+                )
             remote_path = f"/etc/scylla.d/{config_file.name}"
             node.remoter.sudo(f"sh -c 'test -e {remote_path} || install -m 0644 /dev/null {remote_path}'")
             with remote_file(remoter=node.remoter, remote_path=remote_path, sudo=True) as fobj:
                 fobj.truncate(0)  # first clear the file
-                fobj.write(config_file.read_text())
+                fobj.write(content)
 
     def node_setup(self, node: BaseNode, verbose: bool = False, timeout: int = 3600):  # noqa: PLR0912, PLR0914, PLR0915
         node.wait_ssh_up(verbose=verbose, timeout=timeout)
