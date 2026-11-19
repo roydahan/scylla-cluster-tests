@@ -46,7 +46,6 @@ Status=Up/Down
 def _no_retry_sleep(monkeypatch):
     """Skip the sleeps between the retries of `retrying` and of the schema agreement check."""
     monkeypatch.setattr("sdcm.utils.decorators.time.sleep", lambda *_, **__: None)
-    monkeypatch.setattr("sdcm.utils.health_checker.CHECK_NODE_HEALTH_RETRY_DELAY", 0)
 
 
 def _make_nodes(count):
